@@ -159,6 +159,16 @@ async function runDeltaJson(args: string[], opts?: { input?: string; timeoutMs?:
 	return js[js.length - 1];
 }
 
+/** 当前选中的组织(创建线程时必须显式指定)。 */
+async function resolveOrg(): Promise<{ id: string; name: string }> {
+	const cur = await runDeltaJson(["org", "current"]);
+	const id = String(cur?.organization?.id ?? "");
+	if (!id) {
+		throw new Error("未能解析当前组织:请用 delta org switch 选择组织后重试。");
+	}
+	return { id, name: String(cur?.organization?.name ?? id) };
+}
+
 // ---- 扩展工厂:每会话一份 Runtime ----
 
 export default function ompDelta(pi: any) {
@@ -556,8 +566,8 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。 */
-	async function connectShared(mode: "private" | "organization"): Promise<void> {
+	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
+	async function connectShared(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
 		const contract = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
 		const min = Number(contract?.min ?? 0);
 		const max = Number(contract?.max ?? 0);
@@ -579,14 +589,8 @@ export default function ompDelta(pi: any) {
 			throw new Error("仓库没有 Git remote,Delta worktree 创建会失败:先 git remote add origin …");
 		}
 
-		// create 带 --visibility 时必须显式给 --organization：取当前选中的组织
-		const cur = await runDeltaJson(["org", "current"]);
-		const orgId = String(cur?.organization?.id ?? "");
-		if (!orgId) {
-			throw new Error("未能解析当前组织：请用 delta org switch 选择组织后重试。");
-		}
-
-		// 同 source + external-id 幂等：重试/崩溃恢复都安全
+		// 组织已在命令处理器里确认对话框之前解析(resolveOrg),这里直接使用
+		// 同 source + external-id 幂等:重试/崩溃恢复都安全
 		const created = await runDeltaJson(
 			[
 				"thread",
@@ -598,7 +602,7 @@ export default function ompDelta(pi: any) {
 				"--visibility",
 				mode,
 				"--organization",
-				orgId,
+				org.id,
 			],
 			{ cwd: rt.cwd },
 		);
@@ -658,25 +662,25 @@ export default function ompDelta(pi: any) {
 				notify("已连接:" + rt.state.threadId);
 				return;
 			}
-			// 合约要求:共享前必须征得用户同意,并告知可见范围
+			// 合约要求：共享前必须征得用户同意，并告知可见范围（组织名+内容）
 			let ok = true;
 			try {
+				const org = await resolveOrg();
 				if (typeof ctx?.ui?.confirm === "function") {
 					ok = await ctx.ui.confirm(
-						"连接 Delta 并共享给组织?对话记录与工作区文件(含未提交改动)将对组织内可访问。",
+						"连接 Delta 并把会话共享给组织？",
+						"组织：" + org.name + "（" + org.id + "）\n共享内容：对话记录与工作区文件，含未提交改动",
 					);
+				} else {
+					notify("将共享到组织：" + org.name);
 				}
-			} catch {
-				ok = true; // 无确认 UI 的宿主(RPC/print)默认继续,便于实验
-			}
-			if (!ok) {
-				notify("已取消,未创建 Delta 线程。");
-				return;
-			}
-			try {
-				await connectShared("organization");
+				if (!ok) {
+					notify("已取消，未创建 Delta 线程。");
+					return;
+				}
+				await connectShared("organization", org);
 			} catch (e) {
-				notify("连接失败:" + String(e instanceof Error ? e.message : e), "warning");
+				notify("连接失败：" + String(e instanceof Error ? e.message : e), "warning");
 			}
 		},
 	});
