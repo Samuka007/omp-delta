@@ -1,35 +1,45 @@
 # omp-delta
 
-把 oh-my-pi(omp)会话实时记录进 Delta 线程的 omp 扩展——按 [Delta 插件合约 v8](https://delta.dev/docs/cli/build-a-plugin) 实现的社区版 CLI 插件(官方 Pi 插件尚未发布)。
+An **oh-my-pi (omp)** extension that records a live omp session into a **Delta** thread, through the Delta CLI (plugin contract v8).
 
-## 它做什么
+A community implementation of the [officially documented plugin contract](https://delta.dev/docs/cli/build-a-plugin) — the official Pi plugin is still "In Progress" on Delta's roadmap.
 
-- `/delta-share` — 把当前会话连接到一条 Delta 线程:建线程(幂等)→ 挂载 worktree(含未提交改动)→ 共享给组织(先弹确认)
-- 之后自动记录:用户输入、turn 起止、助手回复、工具调用,推送到 Delta(在 Delta 应用/浏览器里可实时围观、评论)
-- 队友在 Delta 里的评论会作为 **follow-up** 回流进 omp 上下文(不会自动触发 turn)
-- 线程被他人接管时自动停止本地 turn(superseded / fenced)
-- 断线自动重试;本地 outbox 保证记录不丢(Delta 未确认前不删,重发安全)
-- `/delta-status` `/delta-detach` `/delta-retry` 管理连接
+## What it does
 
-## 安装
+- `/delta-share` — connect the current omp session to a Delta thread: create thread (idempotent) → attach + mount the worktree (including uncommitted changes) → share with your organization (confirmation first)
+- Records automatically from then on: user input, turn start/stop, assistant replies, tool calls — watchable live in the Delta app or browser
+- Teammate comments in Delta flow back into omp context as follow-ups (never auto-trigger a turn)
+- If someone takes over the thread, the local turn stops (`superseded` / `fenced`)
+- Local outbox keeps every record until Delta confirms it; retryable failures back off automatically
+- `/delta-status`, `/delta-detach`, `/delta-retry` for connection management
+
+## Install
 
 ```sh
 cp omp-delta.ts ~/.omp/agent/extensions/omp-delta.ts
+# restart omp, then run /delta-share inside a git repository
 ```
 
-前提:Delta 桌面版 ≥ 0.23.0(含 delta CLI)并已登录(`delta auth status`)。
+Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp running inside a git repository **with a remote**.
 
-## 已知边界(MVP)
+## Known limits (MVP)
 
-- 只记录主会话;omp 子代理 → Delta 子线程(`thread create --parent`)尚未实现
-- 不回导连接前的历史消息
-- 思考块(thinking)、流式增量不记录;工具卡只有名称与状态,无参数/输出正文
-- 会话切换(/new 等)会断开同步,需在新会话重新 /delta-share
-- `thread share` 固定为 organization 可见性
-- 共享目标为当前选中的组织（delta org current）；如需切换先 delta org switch
-- 必须在 git 仓库目录里连接（worktree 挂载需要）(连接前有确认对话框)
+- Main session only; omp subagents → Delta child threads not yet implemented
+- No history backfill: recording starts when you connect
+- Thinking blocks and streaming deltas are not recorded; tool cards carry name/status only
+- Sharing targets the currently selected organization (`delta org current`)
+- Switching sessions (`/new`) stops sync — run `/delta-share` again in the new session
 
-## 验证过的部分
+## Roadmap (next)
 
-- `node --check`(strip-types)语法通过、模块可加载
-- delta CLI 0.23.0 合约返回 `{min:8,max:8}`,与插件匹配
+- [ ] Parse receipt `disposition` field — real shape: `{"operation":"appended","sequence":n,"disposition":"recorded",...}`
+- [ ] Use `thread status` → `.url` for the join link (share id ≠ thread id)
+- [ ] Precheck git remote before connecting (`worktree create` requires one)
+- [ ] Treat spawn failure/timeout as retryable; compact outbox after ack
+- [ ] Subagents → Delta child threads (`thread create --parent`, shared/isolated worktrees, `thread merge`)
+- [ ] History backfill; thinking blocks → `agent_thought`
+
+## Verified so far
+
+- delta CLI 0.23.0 reports contract `{min:8,max:8}` — matches this plugin
+- Full CLI chain exercised end-to-end: contract → org current → thread create → worktree create/attach/mount → append (receipts) → thread status
