@@ -30,16 +30,14 @@ Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp runn
 - Sharing targets the currently selected organization (`delta org current`)
 - Switching sessions (`/new`) stops sync — run `/delta-share` again in the new session
 
-## Roadmap (next)
+## Roadmap
 
-- [x] Parse receipt `disposition` field — real shape: `{"operation":"appended","sequence":n,"disposition":"recorded",...}`
-- [x] Use `thread status` → `.url` for the join link (share id ≠ thread id)
-- [x] Precheck git repo **and remote** before connecting (`worktree create` requires both)
-- [x] Treat spawn failure/timeout as retryable; compact outbox after ack
-- [ ] Subagents → Delta child threads (`thread create --parent`, shared/isolated worktrees, `thread merge`)
-- [ ] History backfill; thinking blocks → `agent_thought`
+Tracked as GitHub issues — the single source of truth:
+<https://github.com/Samuka007/omp-delta/issues> (OD-1…OD-8; OD-1/OD-2 are P0).
+Done items live in git history and `docs/contract-notes.md`.
 
 ## Verified so far
 
 - delta CLI 0.23.0 reports contract `{min:8,max:8}` — matches this plugin
 - Full CLI chain exercised end-to-end: contract → org current → thread create → worktree create/attach/mount → append (receipts) → thread status
+- Live E2E (omp TUI in a herdr pane): private thread connect, user + assistant messages both render, server acknowledges all records
