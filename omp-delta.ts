@@ -246,11 +246,29 @@ export default function ompDelta(pi: any) {
 		return rt.state.seq;
 	}
 
+	/** 参照 delta-claude:实时活动带 _meta.delta 来源标记,否则外部 producer 的 agent 输出不会被渲染进 transcript。 */
+	function liveActivity(update: Record<string, unknown>): Record<string, unknown> {
+		const kind = update.sessionUpdate;
+		const activityKind =
+			kind === "user_message" || kind === "agent_message" || kind === "agent_thought"
+				? String(kind)
+				: kind === "tool_call_update"
+					? "tool_call"
+					: undefined;
+		if (!activityKind) return update;
+		return {
+			...update,
+			_meta: {
+				delta: { work_origin: "external_agent", interaction_surface: "cli", activity_kind: activityKind },
+			},
+		};
+	}
+
 	/** 分配 sequence、落 outbox、尝试推送。未连接时返回 null。 */
 	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number }): number | null {
 		if (!ready()) return null;
 		const seq = nextSeq();
-		const rec: DeltaRecord = { seq, update };
+		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
 		try {
 			fs.mkdirSync(stateDir(), { recursive: true });
