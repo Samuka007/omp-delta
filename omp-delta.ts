@@ -651,8 +651,8 @@ export default function ompDelta(pi: any) {
 	// ---- 事件与命令注册 ----
 
 	pi.registerCommand("delta-share", {
-		description: "把当前 omp 会话连接到一条 Delta 线程(共享给组织)",
-		handler: async (_args: string, ctx: any) => {
+		description: "把当前 omp 会话连接到 Delta 线程(/delta-share private 为私有,默认共享给组织)",
+		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			if (rt.isSub) {
 				notify("子代理会话暂不支持连接 Delta。", "warning");
@@ -662,23 +662,28 @@ export default function ompDelta(pi: any) {
 				notify("已连接:" + rt.state.threadId);
 				return;
 			}
+			const mode: "private" | "organization" = String(args ?? "").trim().toLowerCase().startsWith("priv")
+				? "private"
+				: "organization";
 			// 合约要求：共享前必须征得用户同意，并告知可见范围（组织名+内容）
 			let ok = true;
 			try {
 				const org = await resolveOrg();
 				if (typeof ctx?.ui?.confirm === "function") {
 					ok = await ctx.ui.confirm(
-						"连接 Delta 并把会话共享给组织？",
-						"组织：" + org.name + "（" + org.id + "）\n共享内容：对话记录与工作区文件，含未提交改动",
+						mode === "private" ? "连接 Delta（私有线程）？" : "连接 Delta 并把会话共享给组织？",
+						mode === "private"
+							? "可见性：私有，仅你自己可见\n共享内容：对话记录与工作区文件，含未提交改动"
+							: "组织：" + org.name + "（" + org.id + "）\n共享内容：对话记录与工作区文件，含未提交改动",
 					);
 				} else {
-					notify("将共享到组织：" + org.name);
+					notify(mode === "private" ? "将创建私有线程。" : "将共享到组织：" + org.name);
 				}
 				if (!ok) {
 					notify("已取消，未创建 Delta 线程。");
 					return;
 				}
-				await connectShared("organization", org);
+				await connectShared(mode, org);
 			} catch (e) {
 				notify("连接失败：" + String(e instanceof Error ? e.message : e), "warning");
 			}
@@ -693,6 +698,7 @@ export default function ompDelta(pi: any) {
 			const lines = [
 				"连接: " + (s.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
 				"线程: " + (s.threadId ?? "无"),
+				s.threadId ? "可见性: " + (s.visibility ?? "未知") : "",
 				s.threadId ? "链接: " + (s.url ?? "(尚未获取,重连后自动更新)") : "",
 				"记录: 已分配 " + s.seq + " 条,已确认 " + s.lastAcked + " 条",
 				"worktree: " + (s.worktreeRef ?? "无"),
