@@ -33,6 +33,7 @@ const SCHEMA_VERSION = 1;
 const APPEND_TIMEOUT_MS = 30_000;
 const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
+const MAX_HISTORY_WAIT_ATTEMPTS = 30; // not_visible 供给窗口期:10s × 30 ≈ 5 分钟
 
 type DeltaRecord = {
 	seq: number;
@@ -61,6 +62,7 @@ type Runtime = {
 	currentTurn: number | null; // running 记录的 seq;turn 内所有记录共用
 	paused: boolean;
 	retryAttempts: number;
+	historyWaitAttempts: number;
 	detaching: boolean;
 	mountChild: ChildProcess | null;
 	watchChild: ChildProcess | null;
@@ -182,6 +184,7 @@ export default function ompDelta(pi: any) {
 		currentTurn: null,
 		paused: false,
 		retryAttempts: 0,
+		historyWaitAttempts: 0,
 		detaching: false,
 		mountChild: null,
 		watchChild: null,
@@ -401,6 +404,7 @@ export default function ompDelta(pi: any) {
 
 			let fenced = false;
 			let retryable = false;
+			let notVisible = false;
 			let retryAfter = 5_000;
 			let errMsg = "";
 			for (const [, st] of receipts) if (st === "fenced") fenced = true;
@@ -411,6 +415,13 @@ export default function ompDelta(pi: any) {
 						if (j.error.retryable === true) {
 							retryable = true;
 							retryAfter = Number(j.error.retry_after_ms) || 5_000;
+						}
+						// 新线程的 history 供给窗口期(可达数分钟):暂不可见但可自愈,单独用长预算重试
+						const reason = String(j.error.reason ?? "");
+						if (reason === "not_visible" || /history is unavailable/i.test(errMsg)) {
+							notVisible = true;
+							retryable = true;
+							retryAfter = 10_000;
 						}
 					}
 				}
@@ -441,11 +452,21 @@ export default function ompDelta(pi: any) {
 				rt.state.lastAcked = newAck;
 				saveState();
 				rt.retryAttempts = 0;
+				rt.historyWaitAttempts = 0;
 				compactOutbox();
 			}
 
 			if (r.code !== 0 && rt.state.lastAcked < rt.state.seq) {
-				if (retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
+				if (retryable && notVisible && rt.historyWaitAttempts < MAX_HISTORY_WAIT_ATTEMPTS) {
+					rt.historyWaitAttempts += 1;
+					notify(
+						"Delta 线程供给中,等待可见("
+						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + errMsg,
+					);
+					lastCtx?.setTimeout?.(() => {
+						void flush();
+					}, retryAfter);
+				} else if (retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
 					rt.retryAttempts += 1;
 					notify(
 						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + errMsg + ")",
