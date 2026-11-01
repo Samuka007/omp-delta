@@ -291,14 +291,23 @@ export default function ompDelta(pi: any) {
 		return seq;
 	}
 
-	/** 已确认的记录从 outbox 文件里清掉,避免无限增长。 */
-	function compactOutbox(all: DeltaRecord[]) {
+	/** 已确认的记录从 outbox 文件里清掉,避免无限增长。
+	 *  必须重新读文件:flush 的 await 期间 emit 可能追加了新记录,用旧快照重写会抹掉它们。 */
+	function compactOutbox() {
 		try {
-			const keep = all.filter((r) => r.seq > rt.state.lastAcked);
-			fs.writeFileSync(
-				outboxPath(),
-				keep.map((r) => JSON.stringify(r)).join("\n") + (keep.length ? "\n" : ""),
-			);
+			const raw = fs.readFileSync(outboxPath(), "utf8");
+			const keep: string[] = [];
+			for (const line of raw.split(/\r?\n/)) {
+				const t = line.trim();
+				if (!t) continue;
+				try {
+					const rec = JSON.parse(t) as DeltaRecord;
+					if (rec.seq > rt.state.lastAcked) keep.push(t);
+				} catch {
+					keep.push(t); // 坏行原样保留,不静默丢弃
+				}
+			}
+			fs.writeFileSync(outboxPath(), keep.join("\n") + (keep.length ? "\n" : ""));
 		} catch (e) {
 			log("outbox 压缩失败: " + String(e));
 		}
@@ -328,7 +337,10 @@ export default function ompDelta(pi: any) {
 				}
 			}
 			const pending = all.filter((r) => r.seq > rt.state.lastAcked);
-			if (pending.length === 0) return;
+			if (pending.length === 0) {
+				rt.retryAttempts = 0;
+				return;
+			}
 
 			// 重发已确认记录安全(Delta 返回 duplicate),故每次推送全部 pending
 			const body =
@@ -401,7 +413,7 @@ export default function ompDelta(pi: any) {
 				rt.state.lastAcked = newAck;
 				saveState();
 				rt.retryAttempts = 0;
-				compactOutbox(all);
+				compactOutbox();
 			}
 
 			if (r.code !== 0 && rt.state.lastAcked < rt.state.seq) {
@@ -417,6 +429,18 @@ export default function ompDelta(pi: any) {
 				} else {
 					rt.paused = true;
 					notify("Delta 推送失败,已暂停自动重试:" + errMsg + "(用 /delta-retry 恢复)", "warning");
+				}
+			}
+			if (r.code === 0 && rt.state.lastAcked < rt.state.seq) {
+				// 部分确认:安排跟进推送;连续无进展则暂停(计数由有进展时归零)
+				if (rt.retryAttempts < MAX_AUTO_RETRIES) {
+					rt.retryAttempts += 1;
+					lastCtx?.setTimeout?.(() => {
+						void flush();
+					}, 1_000);
+				} else {
+					rt.paused = true;
+				notify("Delta 仍有未同步记录,自动重试已达上限(用 /delta-retry 恢复)", "warning");
 				}
 			}
 		} finally {
