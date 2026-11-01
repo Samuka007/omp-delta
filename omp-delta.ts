@@ -635,23 +635,35 @@ export default function ompDelta(pi: any) {
 		);
 		rt.state.threadId = String(created?.thread_id ?? "");
 		rt.state.visibility = mode;
+		saveState(); // threadId 先落盘:后续任一步失败都能凭它幂等重连
 		if (!rt.state.threadId) {
 			throw new Error("thread create 未返回 thread_id: " + JSON.stringify(created).slice(0, 300));
 		}
 
-		// worktree:create 失败时从 list 找回已有 reference(重试安全)
+		// worktree 身份(参考 delta-claude checkoutReference 语义):
+		// list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报错让人选;
+		// 创建/复用后立即落盘,防崩溃孤儿引用。
 		let ref = "";
-		try {
+		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
+		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
+		const norm = (s: string) => s.replace(/[\\/]+$/, "").toLowerCase();
+		const matches = rows.filter((x) => {
+			const p = String(x?.path ?? x?.directory ?? "");
+			return p && norm(p) === norm(rt.cwd);
+		});
+		if (matches.length > 1) {
+			throw new Error("该 checkout 存在多个 worktree 身份,请先在 Delta 里选择正确的一个后重试。");
+		}
+		if (matches.length === 1) {
+			ref = String(matches[0]?.reference ?? "");
+		}
+		if (!ref) {
 			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
 			ref = String(w?.reference ?? "");
-		} catch {
-			const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
-			const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? []);
-			const hit = rows.find((x) => String(x?.path ?? x?.directory ?? "") === rt.cwd);
-			ref = String(hit?.reference ?? "");
 		}
 		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
 		rt.state.worktreeRef = ref;
+		saveState();
 
 		await attachAndStream();
 
