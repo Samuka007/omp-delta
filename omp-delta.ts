@@ -271,7 +271,9 @@ export default function ompDelta(pi: any) {
 
 	/** 分配 sequence、落 outbox、尝试推送。未连接时返回 null。 */
 	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number; sequence?: number }): number | null {
-		if (!ready()) return null;
+		// 门禁:有线程即可排队(离线时记录暂存,重连后续传——合约语义);
+		// connected 不作为门禁,否则建线程后的首条记录(让空线程上服务端)发不出去。
+		if (rt.isSub || rt.paused || !rt.state.threadId) return null;
 		const seq = opts?.sequence ?? nextSeq();
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
@@ -343,7 +345,7 @@ export default function ompDelta(pi: any) {
 
 	/** 把 outbox 里所有未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
 	async function flush(): Promise<void> {
-		if (!rt.state.connected || !rt.state.threadId || flushing || rt.paused) return;
+		if (!rt.state.threadId || flushing || rt.paused) return;
 		flushing = true;
 		try {
 			let raw = "";
@@ -664,6 +666,18 @@ export default function ompDelta(pi: any) {
 		saveState(); // threadId 先落盘:后续任一步失败都能凭它幂等重连
 		if (!rt.state.threadId) {
 			throw new Error("thread create 未返回 thread_id: " + JSON.stringify(created).slice(0, 300));
+		}
+		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
+		if (!rt.state.titleSent) {
+			rt.state.titleSent = true;
+			saveState();
+			let title = "";
+			try {
+				title = String((await pi?.getSessionName?.()) ?? "");
+			} catch {
+				/* 无会话名 */
+			}
+			emit({ sessionUpdate: "session_info_update", title: (title || "omp session").slice(0, 120) });
 		}
 
 		// worktree 身份(参考 delta-claude checkoutReference 语义):
