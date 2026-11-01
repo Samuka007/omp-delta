@@ -63,6 +63,7 @@ type Runtime = {
 	paused: boolean;
 	retryAttempts: number;
 	historyWaitAttempts: number;
+	eventCtx: any; // session_start 的事件 ctx:持有托管 setTimeout
 	detaching: boolean;
 	mountChild: ChildProcess | null;
 	watchChild: ChildProcess | null;
@@ -185,6 +186,7 @@ export default function ompDelta(pi: any) {
 		paused: false,
 		retryAttempts: 0,
 		historyWaitAttempts: 0,
+		eventCtx: null,
 		detaching: false,
 		mountChild: null,
 		watchChild: null,
@@ -346,6 +348,15 @@ export default function ompDelta(pi: any) {
 
 	let flushing = false;
 
+	/** 定时调度:优先事件 ctx 的托管定时器(异常隔离),否则原生 setTimeout 兜底。 */
+	function schedule(fn: () => void, ms: number) {
+		const managed = (rt.eventCtx ?? lastCtx)?.setTimeout?.(fn, ms);
+		if (!managed) {
+			const g = globalThis as any;
+			(g.setTimeout ?? setTimeout)(fn, ms);
+		}
+	}
+
 	/** 把 outbox 里所有未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
 	async function flush(): Promise<void> {
 		if (!rt.state.threadId || flushing || rt.paused) return;
@@ -425,6 +436,14 @@ export default function ompDelta(pi: any) {
 						}
 					}
 				}
+				// JSON 解析失败时的原始文本兑底:CLI 某些报错不带 JSON
+				const rawText = String(r.err || "") + String(r.out || "");
+				if (!retryable && !notVisible && /not_visible|history is unavailable/i.test(rawText)) {
+					notVisible = true;
+					retryable = true;
+					retryAfter = 10_000;
+					if (!errMsg) errMsg = "history not provisioned yet";
+				}
 				if (!errMsg) errMsg = (r.err || r.out || "exit " + r.code).slice(0, 300);
 			}
 			if (r.code === -1) {
@@ -463,7 +482,7 @@ export default function ompDelta(pi: any) {
 						"Delta 线程供给中,等待可见("
 						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + errMsg,
 					);
-					lastCtx?.setTimeout?.(() => {
+					schedule(() => {
 						void flush();
 					}, retryAfter);
 				} else if (retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
@@ -472,7 +491,7 @@ export default function ompDelta(pi: any) {
 						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + errMsg + ")",
 						"warning",
 					);
-					lastCtx?.setTimeout?.(() => {
+					schedule(() => {
 						void flush();
 					}, retryAfter);
 				} else {
@@ -492,6 +511,8 @@ export default function ompDelta(pi: any) {
 				notify("Delta 仍有未同步记录,自动重试已达上限(用 /delta-retry 恢复)", "warning");
 				}
 			}
+		} catch (e) {
+			log("flush 异常: " + String(e));
 		} finally {
 			flushing = false;
 		}
@@ -629,7 +650,7 @@ export default function ompDelta(pi: any) {
 				},
 			);
 			// mount 启动慢时不无限等;进程仍在后台,就绪后会自行上传
-			lastCtx?.setTimeout?.(settle, MOUNT_READY_TIMEOUT_MS);
+			schedule(() => settle(), MOUNT_READY_TIMEOUT_MS);
 		});
 
 		rt.state.connected = true;
@@ -857,6 +878,7 @@ export default function ompDelta(pi: any) {
 
 	pi.on("session_start", async (_event: any, ctx: any) => {
 		lastCtx = ctx;
+		rt.eventCtx = ctx; // 托管定时器来源
 		rt.isSub = (ctx?.agent?.kind ?? "main") !== "main";
 		if (rt.isSub) return;
 		rt.sid = String(ctx?.sessionManager?.getSessionId?.() ?? "sess-" + randomUUID());
