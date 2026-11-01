@@ -693,6 +693,7 @@ export default function ompDelta(pi: any) {
 		description: "把当前 omp 会话连接到 Delta 线程(/delta-share private 为私有,默认共享给组织)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
+			rt.cwd = String(ctx?.cwd ?? rt.cwd); // omp 的 /cd 会改会话 cwd,连接前以当前值为准
 			if (rt.isSub) {
 				notify("子代理会话暂不支持连接 Delta。", "warning");
 				return;
@@ -764,6 +765,7 @@ export default function ompDelta(pi: any) {
 		description: "恢复/重试 Delta 推送(断线后也可重连)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
+			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			rt.paused = false;
 			rt.retryAttempts = 0;
 			if (rt.state.threadId && !rt.state.connected) {
