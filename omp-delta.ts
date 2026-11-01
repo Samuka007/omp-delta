@@ -209,6 +209,10 @@ export default function ompDelta(pi: any) {
 		return path.join(os.homedir(), ".omp", "agent", "omp-delta", rt.sid || "unknown");
 	}
 
+	function statePath(): string {
+		return path.join(stateDir(), "state.json");
+	}
+
 	function loadState() {
 		try {
 			const raw = fs.readFileSync(path.join(stateDir(), "state.json"), "utf8");
