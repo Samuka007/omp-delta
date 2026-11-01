@@ -39,3 +39,28 @@ construct join links from the create id. `status` also exposes
   ```
 
 - Ignored files and local git state (branches) are not shared.
+
+## Rendering gates for externally recorded messages (undocumented)
+
+Sequence numbers being accepted (`next_sequence` advances) does NOT mean records render.
+Two independent requirements, discovered by controlled experiment:
+
+1. **Live-activity marker**: each live record needs
+   `_meta.delta = {work_origin: 'external_agent', interaction_surface: 'cli', activity_kind: 'user_message'|'agent_message'|'agent_thought'|'tool_call'|'edit'}`.
+   Without it the record is stored but never rendered (delta-claude's `liveActivity()` marks
+   every live row this way).
+2. **Real turns**: the `running` state_update must carry `turnSequence` equal to its OWN
+   sequence — that is what opens the turn; agent/tool records then reference that
+   `turnSequence`. A running record without `turnSequence` is recorded as history, the turn
+   never opens, and every record naming it is silently dropped (no item, no error).
+
+Authoritative read-back: `thread watch` **without** `--source/--external-id` (those hide your
+own records!) — count `"type":"item"` frames per kind.
+
+## Windows notes
+
+- `state.json` writes must be atomic (tmp + rename): the extension saves constantly, and
+  readers otherwise observe missing or half-written files.
+- Git Bash mangles leading-`/` arguments (MSYS path conversion) — set `MSYS_NO_PATHCONV=1`
+  when invoking the CLI from bash with thread ids or paths; the same applies to paths passed
+  to `herdr workspace create` (or use `E:/style` paths).
