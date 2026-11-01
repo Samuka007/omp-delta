@@ -98,7 +98,7 @@ function runDelta(
 	return new Promise((resolve) => {
 		let child: ChildProcess;
 		try {
-			child = spawn(resolveDelta(), args, {
+			child = spawn(resolveDelta(), ["--json", ...args], {
 				windowsHide: true,
 				stdio: ["pipe", "pipe", "pipe"],
 				cwd: opts?.cwd,
@@ -394,7 +394,7 @@ export default function ompDelta(pi: any) {
 		onLine: (j: any, raw: string) => void,
 		onClose: (code: number | null) => void,
 	): ChildProcess {
-		const child = spawn(resolveDelta(), args, {
+		const child = spawn(resolveDelta(), ["--json", ...args], {
 			cwd: rt.cwd,
 			windowsHide: true,
 			stdio: ["ignore", "pipe", "pipe"],
