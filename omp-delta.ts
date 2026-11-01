@@ -63,6 +63,7 @@ type Runtime = {
 	paused: boolean;
 	retryAttempts: number;
 	historyWaitAttempts: number;
+	connectAttempts: number;
 	eventCtx: any; // session_start 的事件 ctx:持有托管 setTimeout
 	detaching: boolean;
 	mountChild: ChildProcess | null;
@@ -186,6 +187,7 @@ export default function ompDelta(pi: any) {
 		paused: false,
 		retryAttempts: 0,
 		historyWaitAttempts: 0,
+		connectAttempts: 0,
 		eventCtx: null,
 		detaching: false,
 		mountChild: null,
@@ -655,6 +657,7 @@ export default function ompDelta(pi: any) {
 		});
 
 		rt.state.connected = true;
+		rt.connectAttempts = 0;
 		saveState();
 		startWatch();
 		void flush();
@@ -770,6 +773,30 @@ export default function ompDelta(pi: any) {
 		);
 	}
 
+	/** 供给窗口期错误:服务端尚未可见,可后台重试。 */
+	function isTransientProvisioning(msg: string): boolean {
+		return /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i.test(msg);
+	}
+
+	/** 后台重试连接(供给窗口期实测可达 10+ 分钟,预算 40×30s)。 */
+	async function retryConnect(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
+		try {
+			await connectShared(mode, org);
+		} catch (e) {
+			const msg = String(e instanceof Error ? e.message : e);
+			if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
+				rt.connectAttempts += 1;
+				if (rt.connectAttempts % 5 === 0)
+					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+				schedule(() => {
+					void retryConnect(mode, org);
+				}, 30_000);
+				return;
+			}
+			notify("Delta 重连失败:" + msg, "warning");
+		}
+	}
+
 	function detach(quiet = false) {
 		rt.detaching = true;
 		killChild(rt.mountChild);
@@ -817,9 +844,20 @@ export default function ompDelta(pi: any) {
 					notify("已取消，未创建 Delta 线程。");
 					return;
 				}
+				try {
 				await connectShared(mode, org);
 			} catch (e) {
-				notify("连接失败：" + String(e instanceof Error ? e.message : e), "warning");
+				const msg = String(e instanceof Error ? e.message : e);
+				if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
+					rt.connectAttempts += 1;
+					if (rt.connectAttempts === 1 || rt.connectAttempts % 5 === 0)
+						notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+					schedule(() => {
+						void retryConnect(mode, org);
+					}, 30_000);
+					return;
+				}
+				notify("连接失败:" + msg, "warning");
 			}
 		},
 	});
