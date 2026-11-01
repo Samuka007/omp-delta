@@ -615,12 +615,13 @@ export default function ompDelta(pi: any) {
 		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
 		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
 		let a = a0;
-		// 新线程的后台上传需要几秒;invalid_reference("not in this account")= 服务端还没见到线程,退避重试
-		for (let i = 0; a.code !== 0 && i < 4; i++) {
+		// 新线程的 history/worktree 供给需要数秒到数分钟;这些签名都可退避重试:
+		// not in this account / invalid_reference(服务端还没见到线程)、history is unavailable(供给窗口)
+		for (let i = 0; a.code !== 0 && i < 20; i++) {
 			const blob = String(a.err || a.out);
-			if (!blob.includes("not in this account") && !blob.includes("invalid_reference")) break;
+			if (!/not in this account|invalid_reference|history is unavailable|not_visible/i.test(blob)) break;
 			await new Promise<void>((r) => {
-				const t = lastCtx?.setTimeout?.(r, 3_000);
+				const t = (rt.eventCtx ?? lastCtx)?.setTimeout?.(r, 3_000);
 				if (!t) setTimeout(r, 3_000);
 			});
 			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
