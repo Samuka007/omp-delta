@@ -544,7 +544,10 @@ export default function ompDelta(pi: any) {
 		const ref = String(rt.state.worktreeRef ?? "");
 		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
 		const a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
-		if (a.code !== 0) throw new Error("worktree attach 失败: " + (a.err || a.out).slice(0, 300));
+		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用
+		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
+			throw new Error("worktree attach 失败: " + (a.err || a.out).slice(0, 300));
+		}
 
 		// mount 上传 checkout 并持续同步;ready 行出现即继续,进程保持运行
 		await new Promise<void>((resolveMount) => {
