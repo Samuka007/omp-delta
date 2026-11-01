@@ -529,8 +529,33 @@ export default function ompDelta(pi: any) {
 		}
 
 		// 同 source + external-id 幂等:重试/崩溃恢复都安全
+		// 预检 git 仓库：worktree 挂载需要 git checkout，提前报错更可读
+		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rt.cwd, windowsHide: true });
+		if (g.status !== 0) {
+			throw new Error("当前目录不是 git 仓库，worktree 无法挂载：" + rt.cwd);
+		}
+
+		// create 带 --visibility 时必须显式给 --organization：取当前选中的组织
+		const cur = await runDeltaJson(["org", "current"]);
+		const orgId = String(cur?.organization?.id ?? "");
+		if (!orgId) {
+			throw new Error("未能解析当前组织：请用 delta org switch 选择组织后重试。");
+		}
+
+		// 同 source + external-id 幂等：重试/崩溃恢复都安全
 		const created = await runDeltaJson(
-			["thread", "create", "--source", SOURCE, "--external-id", rt.sid, "--visibility", mode],
+			[
+				"thread",
+				"create",
+				"--source",
+				SOURCE,
+				"--external-id",
+				rt.sid,
+				"--visibility",
+				mode,
+				"--organization",
+				orgId,
+			],
 			{ cwd: rt.cwd },
 		);
 		rt.state.threadId = String(created?.thread_id ?? "");

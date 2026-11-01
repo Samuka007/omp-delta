@@ -25,7 +25,9 @@ cp omp-delta.ts ~/.omp/agent/extensions/omp-delta.ts
 - 不回导连接前的历史消息
 - 思考块(thinking)、流式增量不记录;工具卡只有名称与状态,无参数/输出正文
 - 会话切换(/new 等)会断开同步,需在新会话重新 /delta-share
-- `thread share` 固定为 organization 可见性(连接前有确认对话框)
+- `thread share` 固定为 organization 可见性
+- 共享目标为当前选中的组织（delta org current）；如需切换先 delta org switch
+- 必须在 git 仓库目录里连接（worktree 挂载需要）(连接前有确认对话框)
 
 ## 验证过的部分
 
