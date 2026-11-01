@@ -265,9 +265,9 @@ export default function ompDelta(pi: any) {
 	}
 
 	/** 分配 sequence、落 outbox、尝试推送。未连接时返回 null。 */
-	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number }): number | null {
+	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number; sequence?: number }): number | null {
 		if (!ready()) return null;
-		const seq = nextSeq();
+		const seq = opts?.sequence ?? nextSeq();
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
 		try {
@@ -858,7 +858,10 @@ export default function ompDelta(pi: any) {
 
 	pi.on("turn_start", () => {
 		if (!ready()) return;
-		const seq = emit({ sessionUpdate: "state_update", state: "running" });
+		// 合约要求:running 的 turnSequence 必须等于它自己的 sequence,否则 turn 不会开启,
+		// 后续 agent_message/tool_call 会被服务端静默丢弃(不生成 item)。
+		const seq = nextSeq();
+		emit({ sessionUpdate: "state_update", state: "running" }, { turnSequence: seq, sequence: seq });
 		if (seq !== null) rt.currentTurn = seq;
 	});
 
