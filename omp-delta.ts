@@ -77,6 +77,7 @@ function resolveDelta(): string {
 		"delta",
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta.exe") : "",
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta") : "",
+		"/Applications/Delta.app/Contents/MacOS/delta", // macOS: App Bundle 内置 CLI,未装 PATH 时
 	].filter(Boolean);
 	for (const c of candidates) {
 		try {
