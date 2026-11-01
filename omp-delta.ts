@@ -223,7 +223,10 @@ export default function ompDelta(pi: any) {
 	function saveState() {
 		try {
 			fs.mkdirSync(stateDir(), { recursive: true });
-			fs.writeFileSync(path.join(stateDir(), "state.json"), JSON.stringify(rt.state, null, 2));
+			// 原子写:writeFileSync 直接写会让并发读方看到半截/缺失的 state.json
+			const tmp = statePath() + ".tmp";
+			fs.writeFileSync(tmp, JSON.stringify(rt.state, null, 2));
+			fs.renameSync(tmp, statePath());
 		} catch (e) {
 			log("保存状态失败: " + String(e));
 		}
