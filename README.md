@@ -32,10 +32,10 @@ Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp runn
 
 ## Roadmap (next)
 
-- [ ] Parse receipt `disposition` field — real shape: `{"operation":"appended","sequence":n,"disposition":"recorded",...}`
-- [ ] Use `thread status` → `.url` for the join link (share id ≠ thread id)
-- [ ] Precheck git remote before connecting (`worktree create` requires one)
-- [ ] Treat spawn failure/timeout as retryable; compact outbox after ack
+- [x] Parse receipt `disposition` field — real shape: `{"operation":"appended","sequence":n,"disposition":"recorded",...}`
+- [x] Use `thread status` → `.url` for the join link (share id ≠ thread id)
+- [x] Precheck git repo **and remote** before connecting (`worktree create` requires both)
+- [x] Treat spawn failure/timeout as retryable; compact outbox after ack
 - [ ] Subagents → Delta child threads (`thread create --parent`, shared/isolated worktrees, `thread merge`)
 - [ ] History backfill; thinking blocks → `agent_thought`
 

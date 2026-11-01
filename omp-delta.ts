@@ -45,6 +45,7 @@ type State = {
 	threadId?: string;
 	worktreeRef?: string;
 	visibility?: "private" | "organization";
+	url?: string; // 真实 join 链接,来自 thread status(share id ≠ thread id)
 	seq: number; // 已分配的最大 sequence
 	lastAcked: number; // Delta 已确认的最大连续 sequence
 	titleSent: boolean;
@@ -249,18 +250,23 @@ export default function ompDelta(pi: any) {
 		return seq;
 	}
 
+	// 实测回执形状(docs/contract-notes.md):
+	// {"operation":"appended","sequence":N,"next_sequence":N+1,"duplicate":false,
+	//  "disposition":"recorded","turn_sequence":3,"version":"…"}
+	// 确认结论在 disposition(recorded/duplicate/fenced);兼容旧式 status 字段。
 	function collectReceipts(j: any, into: Map<number, string>) {
 		const items: any[] = Array.isArray(j)
 			? j
 			: Array.isArray(j?.receipts)
 				? j.receipts
-				: j?.sequence !== undefined && j?.status !== undefined
+				: j?.sequence !== undefined && (j?.disposition !== undefined || j?.status !== undefined)
 					? [j]
 					: [];
 		for (const it of items) {
 			const seq = Number(it?.sequence);
-			const st = String(it?.status ?? "");
-			if (Number.isFinite(seq) && st) into.set(seq, st);
+			const st = String(it?.disposition ?? it?.status ?? "");
+			if (!Number.isFinite(seq) || !st) continue;
+			into.set(seq, it?.duplicate === true && st !== "fenced" ? "duplicate" : st);
 		}
 	}
 
@@ -273,6 +279,19 @@ export default function ompDelta(pi: any) {
 		let seq = rt.state.lastAcked;
 		while (acked.get(seq + 1) === true && bySeq.has(seq + 1)) seq += 1;
 		return seq;
+	}
+
+	/** 已确认的记录从 outbox 文件里清掉,避免无限增长。 */
+	function compactOutbox(all: DeltaRecord[]) {
+		try {
+			const keep = all.filter((r) => r.seq > rt.state.lastAcked);
+			fs.writeFileSync(
+				outboxPath(),
+				keep.map((r) => JSON.stringify(r)).join("\n") + (keep.length ? "\n" : ""),
+			);
+		} catch (e) {
+			log("outbox 压缩失败: " + String(e));
+		}
 	}
 
 	let flushing = false;
@@ -347,6 +366,11 @@ export default function ompDelta(pi: any) {
 				}
 				if (!errMsg) errMsg = (r.err || r.out || "exit " + r.code).slice(0, 300);
 			}
+			if (r.code === -1) {
+				// spawn 失败或超时被杀:没有 JSON 错误体,按可重试故障处理
+				retryable = true;
+				if (!errMsg) errMsg = "delta 进程无响应或被终止";
+			}
 
 			if (fenced) {
 				// 该 turn 已被他人接管:合约要求停止本地 turn(已执行的工具效果无法撤销)
@@ -367,6 +391,7 @@ export default function ompDelta(pi: any) {
 				rt.state.lastAcked = newAck;
 				saveState();
 				rt.retryAttempts = 0;
+				compactOutbox(all);
 			}
 
 			if (r.code !== 0 && rt.state.lastAcked < rt.state.seq) {
@@ -514,6 +539,21 @@ export default function ompDelta(pi: any) {
 		saveState();
 		startWatch();
 		void flush();
+
+		// join 链接用的是 share id(thread_01…),不是 thread create 返回的 id,只能问 status
+		try {
+			const st = await runDeltaJson(
+				["thread", "status", String(rt.state.threadId), "--source", SOURCE, "--external-id", rt.sid],
+				{ cwd: rt.cwd },
+			);
+			const url = String(st?.url ?? "");
+			if (url && url !== rt.state.url) {
+				rt.state.url = url;
+				saveState();
+			}
+		} catch {
+			/* 拿不到 url 不影响同步 */
+		}
 	}
 
 	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。 */
@@ -532,7 +572,11 @@ export default function ompDelta(pi: any) {
 		// 预检 git 仓库：worktree 挂载需要 git checkout，提前报错更可读
 		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rt.cwd, windowsHide: true });
 		if (g.status !== 0) {
-			throw new Error("当前目录不是 git 仓库，worktree 无法挂载：" + rt.cwd);
+			throw new Error("当前目录不是 git 仓库,worktree 无法挂载:" + rt.cwd);
+		}
+		const remotes = spawnSync("git", ["remote"], { cwd: rt.cwd, windowsHide: true, encoding: "utf8" });
+		if (!String(remotes.stdout ?? "").trim()) {
+			throw new Error("仓库没有 Git remote,Delta worktree 创建会失败:先 git remote add origin …");
 		}
 
 		// create 带 --visibility 时必须显式给 --organization：取当前选中的组织
@@ -583,8 +627,8 @@ export default function ompDelta(pi: any) {
 		notify(
 			"Delta 线程已连接:" +
 				rt.state.threadId +
-				"\n浏览器打开: https://delta.dev/join/" +
-				rt.state.threadId +
+				"\n浏览器打开: " +
+				(rt.state.url ?? "https://delta.dev/join/" + rt.state.threadId) +
 				"\n(对话与工作区文件,含未提交改动,正在同步到 Delta)",
 		);
 	}
@@ -645,7 +689,7 @@ export default function ompDelta(pi: any) {
 			const lines = [
 				"连接: " + (s.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
 				"线程: " + (s.threadId ?? "无"),
-				s.threadId ? "链接: https://delta.dev/join/" + s.threadId : "",
+				s.threadId ? "链接: " + (s.url ?? "(尚未获取,重连后自动更新)") : "",
 				"记录: 已分配 " + s.seq + " 条,已确认 " + s.lastAcked + " 条",
 				"worktree: " + (s.worktreeRef ?? "无"),
 				"mount/watch: " + (rt.mountChild ? "运行中" : "停止") + " / " + (rt.watchChild ? "运行中" : "停止"),
@@ -699,7 +743,7 @@ export default function ompDelta(pi: any) {
 			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连
 			notify("发现已有 Delta 线程 " + rt.state.threadId + ",后台重连中…");
 			void attachAndStream().then(
-				() => notify("Delta 已重连: https://delta.dev/join/" + rt.state.threadId),
+				() => notify("Delta 已重连: " + (rt.state.url ?? rt.state.threadId)),
 				(e: unknown) =>
 					notify(
 						"Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)",
@@ -721,6 +765,7 @@ export default function ompDelta(pi: any) {
 		if (!ready()) return;
 		const text = String(event?.text ?? event?.prompt ?? "").trim();
 		if (!text) return;
+		if (text.startsWith("/")) return; // slash 命令不是对话内容,不记录
 		if (!rt.state.titleSent) {
 			rt.state.titleSent = true;
 			saveState();
