@@ -571,7 +571,18 @@ export default function ompDelta(pi: any) {
 		rt.detaching = false;
 		const ref = String(rt.state.worktreeRef ?? "");
 		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
-		const a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
+		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
+		let a = a0;
+		// 新线程的后台上传需要几秒;invalid_reference("not in this account")= 服务端还没见到线程,退避重试
+		for (let i = 0; a.code !== 0 && i < 4; i++) {
+			const blob = String(a.err || a.out);
+			if (!blob.includes("not in this account") && !blob.includes("invalid_reference")) break;
+			await new Promise<void>((r) => {
+				const t = lastCtx?.setTimeout?.(r, 3_000);
+				if (!t) setTimeout(r, 3_000);
+			});
+			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
+		}
 		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用
 		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
 			throw new Error("worktree attach 失败: " + (a.err || a.out).slice(0, 300));
