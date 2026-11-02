@@ -233,12 +233,36 @@ export default function ompDelta(pi: any) {
 	}
 
 	function saveState() {
+		let lastErr: unknown = null;
 		try {
 			fs.mkdirSync(stateDir(), { recursive: true });
-			// 原子写:writeFileSync 直接写会让并发读方看到半截/缺失的 state.json
-			const tmp = statePath() + ".tmp";
-			fs.writeFileSync(tmp, JSON.stringify(rt.state, null, 2));
-			fs.renameSync(tmp, statePath());
+			const body = JSON.stringify(rt.state, null, 2);
+			// 原子写:writeFileSync 直接写会让并发读方看到半截/缺失的 state.json。
+			// Windows 上 rename 目标被 AV/索引器/并发读者短暂持有时 EPERM/EACCES。
+			// 策略:唯一 tmp 名先写;rename 失败不重试(内联重试会卡 omp 事件循环),
+			// 立即退化 copy+replace —— 保证 state.json 一旦存在就永不缺失,
+			// 最坏情况读者看到旧一拍的状态,无害。
+			const tmp = statePath() + "." + Date.now() + "-" + Math.random().toString(36).slice(2) + ".tmp";
+			try {
+				fs.writeFileSync(tmp, body);
+				try {
+					fs.renameSync(tmp, statePath());
+					return;
+				} catch (renameErr) {
+					// rename 被锁 → copy 兜底
+					lastErr = renameErr;
+				}
+			} catch (writeErr) {
+				lastErr = writeErr;
+			}
+			try { fs.unlinkSync(tmp); } catch { /* tmp 清理失败无害 */ }
+			// 兜底:copy+replace(非原子,但保证 state.json 一旦存在就永不缺失;
+			// 最坏情况读者看到旧一拍的状态,无害)
+			const tmp2 = statePath() + ".fallback-tmp";
+			fs.writeFileSync(tmp2, body);
+			fs.copyFileSync(tmp2, statePath());
+			try { fs.unlinkSync(tmp2); } catch { /* 无害 */ }
+			log("saveState: rename 失败,已用 copy 兜底(" + String(lastErr).slice(0, 120) + ")");
 		} catch (e) {
 			log("保存状态失败: " + String(e));
 		}
