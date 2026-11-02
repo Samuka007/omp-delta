@@ -33,7 +33,7 @@ const SCHEMA_VERSION = 1;
 const APPEND_TIMEOUT_MS = 30_000;
 const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
-const MAX_HISTORY_WAIT_ATTEMPTS = 30; // not_visible 供给窗口期:10s × 30 ≈ 5 分钟
+const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible 供给窗口期:30s × 60 ≈ 30 分钟(实测可超 10 分钟)
 
 type DeltaRecord = {
 	seq: number;
@@ -463,7 +463,7 @@ export default function ompDelta(pi: any) {
 						if (reason === "not_visible" || /history is unavailable/i.test(errMsg)) {
 							notVisible = true;
 							retryable = true;
-							retryAfter = 10_000;
+							retryAfter = 30_000;
 						}
 					}
 				}
@@ -472,7 +472,7 @@ export default function ompDelta(pi: any) {
 				if (!retryable && !notVisible && /not_visible|history is unavailable/i.test(rawText)) {
 					notVisible = true;
 					retryable = true;
-					retryAfter = 10_000;
+					retryAfter = 30_000;
 					if (!errMsg) errMsg = "history not provisioned yet";
 				}
 				if (!errMsg) errMsg = (r.err || r.out || "exit " + r.code).slice(0, 300);
