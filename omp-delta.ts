@@ -217,6 +217,11 @@ export default function ompDelta(pi: any) {
 		return path.join(os.homedir(), ".omp", "agent", "omp-delta", rt.sid || "unknown");
 	}
 
+	/** 路径归一化比较(Windows/POSIX 分隔符与大小写)。 */
+	function normPath(p: string): string {
+		return p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
+	}
+
 	function statePath(): string {
 		return path.join(stateDir(), "state.json");
 	}
@@ -652,9 +657,19 @@ export default function ompDelta(pi: any) {
 			});
 			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
 		}
-		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用
-		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
-			throw new Error("worktree attach 失败: " + (a.err || a.out).slice(0, 300));
+		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用。
+		// 若 state 是别的目录写入的(跨目录 autoResume),复用必然错配,给出明确指引而非哑错误。
+		if (a.code !== 0) {
+			const attachBlob = String(a.err || a.out);
+			if (!attachBlob.includes("already has a worktree")) {
+				throw new Error("worktree attach 失败: " + attachBlob.slice(0, 300));
+			}
+			if (rt.state.cwd && normPath(rt.state.cwd) !== normPath(rt.cwd)) {
+				throw new Error(
+					"线程绑定的是 " + rt.state.cwd + " 的 checkout,当前目录是 " + rt.cwd
+						+ ";请在当前目录重新 /delta-share(旧线程保留在 Delta)。",
+				);
+			}
 		}
 
 		// mount 上传 checkout 并持续同步;ready 行出现即继续,进程保持运行
@@ -784,6 +799,7 @@ export default function ompDelta(pi: any) {
 		}
 		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
 		rt.state.worktreeRef = ref;
+		rt.state.cwd = rt.cwd; // 记录绑定时的目录:autoResume 换目录启动时可检测错配
 		saveState();
 
 		await attachAndStream();
