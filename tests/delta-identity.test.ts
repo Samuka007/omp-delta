@@ -58,7 +58,7 @@ describe("resolveIdentityFromStatus", () => {
 	});
 });
 
-	describe("pickWorktreeForCwd", () => {
+describe("pickWorktreeForCwd", () => {
 	const items = [
 		{ reference: "ref-a", path: "E:\\dev\\omp-delta" },
 		{ reference: "ref-b", directory: "/Users/samuka_007/omp-delta" },
