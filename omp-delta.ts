@@ -386,7 +386,7 @@ export type RenumberResult = { pending: DeltaRecord[]; seq: number; lastAcked: n
  *  内部 turnSequence 引用(指向同队列的 running 记录)经同一映射修正。原地改写 pending。 */
 export function renumberFrom(pending: DeltaRecord[], serverNext: number): RenumberResult {
 	const seqMap = new Map<number, number>();
-	let s = Math.max(0, serverNext);
+	let s = Math.max(1, serverNext); // 全新 producer 从 1 起;已有游标从 next_sequence 继续
 	for (const r of pending) {
 		seqMap.set(r.seq, s);
 		if (r.turnSequence !== undefined && seqMap.has(r.turnSequence)) {
@@ -927,13 +927,10 @@ export default function ompDelta(pi: any) {
 			);
 			const id = resolveIdentityFromStatus(st);
 			if (!id) throw new Error("thread status 未返回 thread_id");
+			// omp -r 恢复会话会 fork 出新 sid:marker 在、external_id 不同 → 以新 producer
+			// 身份重绑同一线程(per-producer 游标独立,不会重复);无需用户重新 /delta-share。
 			if (id.externalId && id.externalId !== rt.sid) {
-				notify(
-					"该 Delta 线程绑定的是会话 " + id.externalId + "(本会话可能是 fork);如需同步请 /delta-share 重新连接。",
-					"warning",
-				);
-				rt.expectingIdentity = false;
-				return;
+				notify("会话已分叉(" + id.externalId + " → " + rt.sid + "):以新 producer 续录同一线程。");
 			}
 			rt.threadId = id.threadId;
 			rt.url = id.url || null;
