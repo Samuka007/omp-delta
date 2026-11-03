@@ -157,7 +157,7 @@ function runDelta(
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			if ((code ?? -1) !== 0) dumpSpawnEnvOnce(); // #11:失败时留下环境快照
+			dumpSpawnEnvOnce(); // 首次调用即记录:对比 omp 内/外 delta 的运行环境(#11)
 			resolve({ code: code ?? -1, out, err });
 		});
 		if (opts?.input !== undefined) child.stdin?.write(opts.input);
@@ -166,26 +166,25 @@ function runDelta(
 }
 
 export function parseJsonLines(text: string): any[] {
-	const result: any[] = [];
-	for (const line of text.split(/\r?\n/)) {
-		const t = line.trim();
-		if (!t) continue;
+	const t = text.trim();
+	// 以 [ / { 开头的输出优先整体解析:pretty-printed JSON(如 thread list)的行里
+	// 恰好整行都是字符串字面量时,逐行解析会得到一堆垃圾字符串,
+	// 导致"看起来解析成功"而永远不走兜底 —— 必须先试整体。JSONL 多值流整体解析失败,自然落到逐行。
+	if (t.startsWith("[") || t.startsWith("{")) {
 		try {
-			result.push(JSON.parse(t));
+			return [JSON.parse(t)];
 		} catch {
-			/* 非 JSON 行,忽略 */
+			/* 多值 JSONL 流:落回逐行 */
 		}
 	}
-	// 兜底:thread list 等“JSON 但 pretty-printed”的输出整体不是 JSONL,
-	// 逐行解析会颗粒无收 —— 能整体 parse 时按单值返回
-	if (result.length === 0) {
-		const t = text.trim();
-		if (t.startsWith("[") || t.startsWith("{")) {
-			try {
-				result.push(JSON.parse(t));
-			} catch {
-				/* 输出不是合法 JSON */
-			}
+	const result: any[] = [];
+	for (const line of t.split(/\r?\n/)) {
+		const line2 = line.trim();
+		if (!line2) continue;
+		try {
+			result.push(JSON.parse(line2));
+		} catch {
+			/* 非 JSON 行,忽略 */
 		}
 	}
 	return result;
@@ -955,9 +954,7 @@ export default function ompDelta(pi: any) {
 	 *  权威在 DeltaDB,不依赖会话 id 的连续性 —— omp 的 continuation 链对它透明。 */
 	async function discoverBindingByCheckout(): Promise<{ threadId: string; worktreeRef?: string } | null> {
 		const lr = await runDelta(["thread", "list"], { cwd: rt.cwd });
-		if (lr.code !== 0 || lr.out.trim().length === 0) {
-			log("discovery: thread list code=" + lr.code + " out=" + lr.out.slice(0, 200) + " err=" + lr.err.slice(0, 200));
-		}
+		log("discovery: thread list code=" + lr.code + " out[0:180]=" + lr.out.slice(0, 180).replace(/\s+/g, " ") + " err[0:120]=" + lr.err.slice(0, 120).replace(/\s+/g, " "));
 		const list = (() => {
 			try {
 				return runDeltaJsonFromText(lr.out, lr.err);
