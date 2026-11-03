@@ -79,6 +79,23 @@ type Runtime = {
 // ---- 无状态 Delta CLI 进程封装(模块级) ----
 
 let deltaBin: string | null = null;
+let envDumped = false;
+
+/** #11 诊断:delta 在 omp 内 spawn 时报 NotFound、外部终端同命令秒通。
+ *  首次失败时把解析到的二进制与关键 env 写进 omp 日志,定位环境差异。 */
+function dumpSpawnEnvOnce() {
+	if (envDumped) return;
+	envDumped = true;
+	const keys = ["PATH", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOME", "OMP_SESSION_ID", "DELTA_DATA_DIR", "DELTA_CONFIG_DIR"];
+	const snap = keys
+		.map((k) => k + "=" + (process.env[k] === undefined ? "<unset>" : String(process.env[k]).slice(0, 200)))
+		.join(" | ");
+	try {
+		console.error("[omp-delta] spawn env snapshot: binary=" + (deltaBin ?? "<unresolved>") + " ; " + snap);
+	} catch {
+		/* console 不可用则跳过 */
+	}
+}
 
 function resolveDelta(): string {
 	if (deltaBin) return deltaBin;
@@ -140,6 +157,7 @@ function runDelta(
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
+			if ((code ?? -1) !== 0) dumpSpawnEnvOnce(); // #11:失败时留下环境快照
 			resolve({ code: code ?? -1, out, err });
 		});
 		if (opts?.input !== undefined) child.stdin?.write(opts.input);
