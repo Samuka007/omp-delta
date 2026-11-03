@@ -25,7 +25,7 @@ Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp runn
 ## Known limits (MVP)
 
 - Main session only; omp subagents → Delta child threads not yet implemented
-- No history backfill: recording starts when you connect; records emitted before the server cursor is known are dropped
+- No history backfill: recording starts when you connect; while a reconnect is in flight, events queue in memory and are renumbered onto the server cursor when it arrives (dropped only when no session binding exists)
 - Thinking blocks and streaming deltas are not recorded; tool cards carry name/status only
 - Sharing targets the currently selected organization (`delta org current`)
 - Switching sessions (`/new`) stops sync — run `/delta-share` again in the new session
