@@ -358,12 +358,29 @@ export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
 
 export type WorktreePick = { ref: string; ambiguous: boolean };
 
-/** 从 worktree 列表里挑出当前 checkout 的身份;多个匹配必须报歧义,不静默选择。 */
+/** 一个 worktree 条目上报的所有 checkout 目录:顶层 path/directory + 嵌套 checkouts[].directory
+ *  (实采形状:delta 会把 checkout 物化在 <cwd>/.delta/worktrees/<uuid>/… 下,state 可为 inactive)。 */
+function worktreeDirs(item: any): string[] {
+	const dirs: string[] = [];
+	const direct = String(item?.path ?? item?.directory ?? "");
+	if (direct) dirs.push(direct);
+	for (const c of Array.isArray(item?.checkouts) ? item.checkouts : []) {
+		const d = String(c?.directory ?? "");
+		if (d) dirs.push(d);
+	}
+	return dirs;
+}
+
+/** 从 worktree 列表里挑出当前 checkout 的身份;多个匹配必须报歧义,不静默选择。
+ *  匹配规则:目录相等,或是当前 cwd 下 .delta/ 受管子树(delta 物化的 checkout)。 */
 export function pickWorktreeForCwd(items: any[], cwd: string): WorktreePick {
-	const matches = items.filter((x) => {
-		const p = String(x?.path ?? x?.directory ?? "");
-		return p && normPath(p) === normPath(cwd);
-	});
+	const base = normPath(cwd);
+	const matches = items.filter((x) =>
+		worktreeDirs(x).some((d) => {
+			const n = normPath(d);
+			return n === base || n.startsWith(base + "/.delta/");
+		}),
+	);
 	if (matches.length > 1) return { ref: "", ambiguous: true };
 	return { ref: matches.length === 1 ? String(matches[0]?.reference ?? "") : "", ambiguous: false };
 }

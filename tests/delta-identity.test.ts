@@ -60,16 +60,22 @@ describe("resolveIdentityFromStatus", () => {
 });
 
 describe("pickWorktreeForCwd", () => {
-	const items = [
-		{ reference: "ref-a", path: "E:\\dev\\omp-delta" },
-		{ reference: "ref-b", directory: "/Users/samuka_007/omp-delta" },
-	];
+const items = [
+	// 实采形状:delta 把 checkout 物化在主 cwd 的 .delta/worktrees/ 子树(嵌套 checkouts[].directory)
+	{
+		reference: "2d47df5a-4d12-4586-aa8f-ad8712689747#t=4a31e0b6",
+		checkouts: [
+			{ directory: "E:\\dev\\omp-delta\\.delta\\worktrees\\wmv7r98h393d/omp-delta", state: "inactive" },
+		],
+	},
+	{ reference: "ref-b", directory: "/Users/samuka_007/omp-delta" },
+];
 
-	it("matches the checkout by normalized path (windows separators, case, trailing slash)", () => {
-		const r = pickWorktreeForCwd(items, "e:/dev/omp-delta/");
-		assert.equal(r.ref, "ref-a");
-		assert.equal(r.ambiguous, false);
-	});
+it("matches the checkout by normalized path (windows separators, case, trailing slash)", () => {
+	const r = pickWorktreeForCwd(items, "e:/dev/omp-delta/");
+	assert.equal(r.ref, "2d47df5a-4d12-4586-aa8f-ad8712689747#t=4a31e0b6");
+	assert.equal(r.ambiguous, false);
+});
 
 	it("matches the directory-keyed variant", () => {
 		const r = pickWorktreeForCwd(items, "/Users/Samuka_007/omp-delta");
@@ -83,10 +89,16 @@ describe("pickWorktreeForCwd", () => {
 	});
 
 	it("multiple matches are ambiguous and must not silently pick one", () => {
-		const dup = [...items, { reference: "ref-c", path: "E:/dev/omp-delta" }];
+		const dup = [...items, { reference: "ref-c", checkouts: [{ directory: "E:/dev/omp-delta/.delta/worktrees/other" }] }];
 		const r = pickWorktreeForCwd(dup, "E:\\dev\\omp-delta");
 		assert.equal(r.ref, "");
 		assert.equal(r.ambiguous, true);
+	});
+
+	it("a sibling checkout one level up does not match", () => {
+		const r = pickWorktreeForCwd(items, "E:/dev/omp-delta-e2e4");
+		assert.equal(r.ref, "");
+		assert.equal(r.ambiguous, false);
 	});
 });
 
