@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	pickWorktreeForCwd,
 	reconcileSequenceState,
+	renumberFrom,
 	resolveIdentityFromStatus,
 } from "../omp-delta.ts";
 
@@ -117,5 +118,31 @@ describe("reconcileSequenceState", () => {
 		const r = reconcileSequenceState([], 0);
 		assert.equal(r.seq, 0);
 		assert.equal(r.lastAcked, 0);
+	});
+});
+
+describe("renumberFrom", () => {
+	const rec = (seq: number, turnSequence?: number) =>
+		turnSequence === undefined ? { seq, update: {} } : { seq, turnSequence, update: {} };
+
+	it("renumbers provisional records to continue from the server cursor", () => {
+		const pending = [rec(1), rec(2), rec(3)];
+		const r = renumberFrom(pending, 14);
+		assert.deepEqual(pending.map((x) => x.seq), [14, 15, 16]);
+		assert.equal(r.seq, 16);
+	});
+
+	it("remaps internal turnSequence references through the same map", () => {
+		const pending = [rec(1, 1), rec(2, 1), rec(3, 2)];
+		renumberFrom(pending, 14);
+		assert.deepEqual(
+			pending.map((x) => x.turnSequence),
+			[14, 14, 15],
+		);
+	});
+
+	it("empty provisional queue just returns the cursor", () => {
+		const r = renumberFrom([], 7);
+		assert.equal(r.seq, 6);
 	});
 });

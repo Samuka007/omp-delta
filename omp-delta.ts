@@ -66,6 +66,7 @@ type Runtime = {
 	seqReady: boolean;
 	currentTurn: number | null; // running 记录的 seq;turn 内所有记录共用
 	paused: boolean;
+	expectingIdentity: boolean; // 重连在途:事件照常入临时队列,游标到达后重编号
 	retryAttempts: number;
 	historyWaitAttempts: number;
 	connectAttempts: number;
@@ -361,6 +362,24 @@ export function reconcileSequenceState(pending: DeltaRecord[], serverNext: numbe
 	return { pending: kept, seq, lastAcked: cursor };
 }
 
+export type RenumberResult = { pending: DeltaRecord[]; seq: number; lastAcked: number; seqMap: Map<number, number> };
+
+/** 首次对齐用:临时队列里的记录从未上过服务端,可安全重编号衔接服务端游标;
+ *  内部 turnSequence 引用(指向同队列的 running 记录)经同一映射修正。原地改写 pending。 */
+export function renumberFrom(pending: DeltaRecord[], serverNext: number): RenumberResult {
+	const seqMap = new Map<number, number>();
+	let s = Math.max(0, serverNext);
+	for (const r of pending) {
+		seqMap.set(r.seq, s);
+		if (r.turnSequence !== undefined && seqMap.has(r.turnSequence)) {
+			r.turnSequence = seqMap.get(r.turnSequence);
+		}
+		r.seq = s;
+		s += 1;
+	}
+	return { pending, seq: s - 1, lastAcked: Math.max(0, serverNext - 1), seqMap };
+}
+
 // ---- 扩展工厂:每会话一份 Runtime ----
 
 export default function ompDelta(pi: any) {
@@ -381,6 +400,7 @@ export default function ompDelta(pi: any) {
 		seqReady: false,
 		currentTurn: null,
 		paused: false,
+		expectingIdentity: false,
 		retryAttempts: 0,
 		historyWaitAttempts: 0,
 		connectAttempts: 0,
@@ -409,8 +429,10 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	function ready(): boolean {
-		return !rt.isSub && rt.connected && !!rt.threadId && !rt.paused;
+	function shouldRecord(): boolean {
+		// 重连在途(expectingIdentity)时也记录:进临时队列,游标到达后安全重编号;
+		// 没有任何绑定前景时才丢弃。
+		return !rt.isSub && !rt.paused && (rt.seqReady || rt.expectingIdentity);
 	}
 
 	function nextSeq(): number {
@@ -418,11 +440,11 @@ export default function ompDelta(pi: any) {
 		return rt.seq;
 	}
 
-	/** 分配 sequence、入队、尝试推送。游标未就绪或已暂停时返回 null。 */
+	/** 分配 sequence、入队、尝试推送。无绑定前景或已暂停时返回 null。 */
 	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number; sequence?: number }): number | null {
-		// 门禁:游标就绪(已从服务端 next_sequence 对齐)才能发,否则序号必然重复/断裂。
 		// 记录只进内存队列:权威内容在 omp session JSONL,权威送达游标在服务端。
-		if (rt.isSub || rt.paused || !rt.seqReady || !rt.threadId) return null;
+		// seqReady 前的记录走临时编号,游标到达时由 adoptServerCursor 重编号。
+		if (!shouldRecord()) return null;
 		const seq = opts?.sequence ?? nextSeq();
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
@@ -444,7 +466,7 @@ export default function ompDelta(pi: any) {
 
 	/** 把未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
 	async function flush(): Promise<void> {
-		if (!rt.threadId || flushing || rt.paused) return;
+		if (!rt.threadId || !rt.seqReady || flushing || rt.paused) return;
 		flushing = true;
 		try {
 			const pending = rt.pending.filter((r) => r.seq > rt.lastAcked);
@@ -636,7 +658,7 @@ export default function ompDelta(pi: any) {
 
 	/** 已有线程:挂载 worktree + 启动 watch + 推送积压记录。 */
 	/** 从 omp 会话条目里取最新的绑定标记(appendEntry 写入;无则 null)。 */
-	function findSessionMarker(ctx: any): { threadId: string; worktreeRef?: string } | null {
+	function findSessionMarker(ctx: any): { threadId: string; worktreeRef?: string; cwd?: string } | null {
 		try {
 			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
 			let marker: { threadId: string; worktreeRef?: string } | null = null;
@@ -651,12 +673,30 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	/** 把对齐结果落进运行时:服务端游标为准,seqReady 放行 emit。 */
+	/** 把对齐结果落进运行时:服务端游标为准,seqReady 放行 flush/emit。 */
 	function applySequenceState(rc: { pending: DeltaRecord[]; seq: number; lastAcked: number }) {
 		rt.pending = rc.pending;
 		rt.seq = rc.seq;
 		rt.lastAcked = rc.lastAcked;
 		rt.seqReady = true;
+	}
+
+	/** 游标到达时的统一入口:已发送过的队列用 reconcile(丢已送达、保未送达),
+	 *  临时队列(重连在途期间排队的记录)用 renumberFrom(从未上服务端,安全重编号,
+	 *  内部 turnSequence 引用与 currentTurn 一并映射)。 */
+	function adoptServerCursor(serverNext: number) {
+		if (rt.seqReady) {
+			applySequenceState(reconcileSequenceState(rt.pending, serverNext));
+			return;
+		}
+		const r = renumberFrom(rt.pending, serverNext);
+		rt.pending = r.pending;
+		rt.seq = r.seq;
+		rt.lastAcked = r.lastAcked;
+		rt.seqReady = true;
+		if (rt.currentTurn !== null && r.seqMap.has(rt.currentTurn)) {
+			rt.currentTurn = r.seqMap.get(rt.currentTurn)!;
+		}
 	}
 
 	async function attachAndStream(): Promise<void> {
@@ -763,7 +803,7 @@ export default function ompDelta(pi: any) {
 		);
 		const id = resolveIdentityFromStatus(st);
 		rt.url = id?.url ?? null;
-		applySequenceState(reconcileSequenceState(rt.pending, id?.nextSequence ?? 0));
+	adoptServerCursor(id?.nextSequence ?? 0);
 
 		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
 		if (!rt.titleSent) {
@@ -796,12 +836,13 @@ export default function ompDelta(pi: any) {
 		await attachAndStream();
 
 		// 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
-		// 重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录。
-		// 只写读取方需要的字段:threadId + worktreeRef。
+		// 重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录;
+		// cwd 用于重连时检测跨目录恢复,防把旧线程挂到错误 checkout。
 		try {
 			pi?.appendEntry?.(MARKER_TYPE, {
 				threadId: rt.threadId,
 				worktreeRef: rt.worktreeRef,
+				cwd: rt.cwd,
 			});
 		} catch {
 			/* 标记失败不影响本次连接;下次需手动 /delta-share */
@@ -846,8 +887,13 @@ export default function ompDelta(pi: any) {
 	}
 
 	/** 凭会话标记重连:status 校验 external_id(防 fork 静默续录)→ 对齐服务端游标 → attach。
-	 *  身份权威在 DeltaDB:status 失败/线程不属于本会话时给明确指引,不静默重建。 */
-	async function reconnectByIdentity(marker: { threadId: string; worktreeRef?: string }): Promise<void> {
+	 *  身份权威在 DeltaDB:status 失败/线程不属于本会话时给明确指引,不静默重建。
+	 *  决定性失败(mismatch/歧义/跨目录)会关闭 expectingIdentity;暂时性错误保留它,记录继续排队。 */
+	async function reconnectByIdentity(marker: {
+		threadId: string;
+		worktreeRef?: string;
+		cwd?: string;
+	}): Promise<void> {
 		try {
 			const st = await runDeltaJson(
 				["thread", "status", String(marker.threadId), "--source", SOURCE, "--external-id", rt.sid],
@@ -860,6 +906,7 @@ export default function ompDelta(pi: any) {
 					"该 Delta 线程绑定的是会话 " + id.externalId + "(本会话可能是 fork);如需同步请 /delta-share 重新连接。",
 					"warning",
 				);
+				rt.expectingIdentity = false;
 				return;
 			}
 			rt.threadId = id.threadId;
@@ -868,13 +915,29 @@ export default function ompDelta(pi: any) {
 			const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
 			if (pick.ambiguous) {
 				notify("该线程挂了多个 worktree 身份,请 /delta-share 重新绑定。", "warning");
+				rt.expectingIdentity = false;
 				return;
 			}
-			rt.worktreeRef = pick.ref || String(marker.worktreeRef ?? "");
-			applySequenceState(reconcileSequenceState(rt.pending, id.nextSequence));
+			let ref = pick.ref;
+			if (!ref) {
+				// status 没列出匹配当前目录的 worktree:标记目录也不同时拒绝,防把旧线程挂到错误 checkout
+				if (marker.cwd && normPath(marker.cwd) !== normPath(rt.cwd)) {
+					notify(
+						"该 Delta 线程绑定的是 " + marker.cwd + " 的 checkout,当前目录是 " + rt.cwd
+							+ ";请在原目录打开 omp,或重新 /delta-share(旧线程保留在 Delta)。",
+							"warning",
+						);
+						rt.expectingIdentity = false;
+						return;
+					}
+				ref = String(marker.worktreeRef ?? "");
+			}
+			rt.worktreeRef = ref;
+			adoptServerCursor(id.nextSequence);
 			await attachAndStream();
 			notify("Delta 已重连: " + (rt.url ?? rt.threadId));
 		} catch (e) {
+			// 暂时性错误(含供给窗口):expectingIdentity 保留,记录继续排队;/delta-retry 可再试
 			notify("Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)", "warning");
 		}
 	}
@@ -989,6 +1052,7 @@ export default function ompDelta(pi: any) {
 				const marker = findSessionMarker(ctx);
 				if (marker) {
 					notify("凭会话标记重连 Delta 线程 " + marker.threadId + " …");
+					rt.expectingIdentity = true;
 					await reconnectByIdentity(marker);
 				} else {
 					notify("尚未绑定 Delta 线程;用 /delta-share 连接。");
@@ -1010,7 +1074,9 @@ export default function ompDelta(pi: any) {
 		// 有标记 → 后台凭它重连;无标记 → 等用户显式 /delta-share。
 		const marker = findSessionMarker(ctx);
 		if (marker) {
-			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连
+			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连;
+			// 等待期间事件照常入临时队列(expectingIdentity),游标到达后重编号补发
+			rt.expectingIdentity = true;
 			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
 			void reconnectByIdentity(marker);
 		}
@@ -1025,7 +1091,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("input", async (event: any) => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		const text = String(event?.text ?? event?.prompt ?? "").trim();
 		if (!text) return;
 		if (text.startsWith("/")) return; // slash 命令不是对话内容,不记录
@@ -1047,7 +1113,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("turn_start", () => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		// 合约要求:running 的 turnSequence 必须等于它自己的 sequence,否则 turn 不会开启,
 		// 后续 agent_message/tool_call 会被服务端静默丢弃(不生成 item)。
 		const seq = nextSeq();
@@ -1056,7 +1122,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("turn_end", () => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		if (rt.currentTurn !== null) {
 			emit({ sessionUpdate: "state_update", state: "idle" }, { turnSequence: rt.currentTurn });
 		}
@@ -1064,7 +1130,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("assistant_message", (event: any) => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		const blocks: any[] = Array.isArray(event?.message?.content) ? event.message.content : [];
 		const text = blocks
 			.filter((b) => b?.type === "text" && typeof b.text === "string")
@@ -1083,7 +1149,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("tool_execution_start", (event: any) => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		const id = String(event?.toolCallId ?? event?.callId ?? "");
 		if (!id) return;
 		emit(
@@ -1098,7 +1164,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("tool_execution_end", (event: any) => {
-		if (!ready()) return;
+		if (!shouldRecord()) return;
 		const id = String(event?.toolCallId ?? event?.callId ?? "");
 		if (!id) return;
 		emit(
