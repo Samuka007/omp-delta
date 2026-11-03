@@ -912,6 +912,40 @@ export default function ompDelta(pi: any) {
 		if (!quiet) notify("已断开 Delta 同步(线程与已上传内容保留)。");
 	}
 
+	/** 慢路径发现:moveOff/fork 后本会话无 marker,改从服务端找"绑定过当前 checkout
+	 *  的最近 omp 线程"(thread list → 逐个 status → worktrees 匹配 cwd)。
+	 *  权威在 DeltaDB,不依赖会话 id 的连续性 —— omp 的 continuation 链对它透明。 */
+	async function discoverBindingByCheckout(): Promise<{ threadId: string; worktreeRef?: string } | null> {
+		const list = await runDeltaJson(["thread", "list"], { cwd: rt.cwd });
+		const rows: any[] = Array.isArray(list)
+			? list
+			: Array.isArray(list?.threads)
+				? list.threads
+				: Array.isArray(list?.items)
+					? list.items
+					: [];
+		const sorted = rows
+			.slice()
+			.sort((a, b) => String(b?.created_at_utc ?? "").localeCompare(String(a?.created_at_utc ?? "")));
+		for (const row of sorted.slice(0, 8)) {
+			const tid = String(row?.id ?? "");
+			if (!tid) continue;
+			try {
+				const st = await runDeltaJson(
+					["thread", "status", tid, "--source", SOURCE, "--external-id", rt.sid],
+					{ cwd: rt.cwd },
+				);
+				const id = resolveIdentityFromStatus(st);
+				if (!id) continue;
+				const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
+				if (pick.ref && !pick.ambiguous) return { threadId: tid, worktreeRef: pick.ref };
+			} catch {
+				/* 该候选不可见/不属于我们:试下一个 */
+			}
+		}
+		return null;
+	}
+
 	/** 凭会话标记重连:status 校验 external_id(防 fork 静默续录)→ 对齐服务端游标 → attach。
 	 *  身份权威在 DeltaDB:status 失败/线程不属于本会话时给明确指引,不静默重建。
 	 *  决定性失败(mismatch/歧义/跨目录)会关闭 expectingIdentity;暂时性错误保留它,记录继续排队。 */
@@ -1104,6 +1138,24 @@ export default function ompDelta(pi: any) {
 			rt.expectingIdentity = true;
 			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
 			void reconnectByIdentity(marker);
+		} else {
+			// 无 marker(moveOff/fork/首次):从服务端按 checkout 发现绑定;
+			// 发现不了才是真正的首次,等用户显式 /delta-share。
+			rt.expectingIdentity = true;
+			void (async () => {
+				try {
+					const found = await discoverBindingByCheckout();
+					if (found) {
+						notify("发现绑定当前 checkout 的 Delta 线程 " + found.threadId + ",后台重连中…");
+						await reconnectByIdentity(found);
+					} else {
+						rt.expectingIdentity = false;
+					}
+				} catch (e) {
+					rt.expectingIdentity = false;
+					notify("Delta 绑定发现失败:" + String(e instanceof Error ? e.message : e) + "(/delta-share 可手动连接)", "warning");
+				}
+			})();
 		}
 	});
 
