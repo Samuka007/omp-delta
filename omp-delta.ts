@@ -138,27 +138,41 @@ function runDelta(
 		}
 		let out = "";
 		let err = "";
+		let done = false;
+		const finish = (code: number) => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			clearTimeout(hardKill);
+			dumpSpawnEnvOnce(); // 首次调用即记录:对比 omp 内/外 delta 的运行环境(#11)
+			resolve({ code, out, err });
+		};
 		const timer = setTimeout(() => {
 			try {
-				child.kill("SIGTERM");
+				child.kill();
 			} catch {
 				/* 已退出 */
 			}
 		}, opts?.timeoutMs ?? APPEND_TIMEOUT_MS);
+		// Windows 上 SIGTERM 后孙进程可能仍握住 stdio 管道,close 事件永不触发:
+		// 兜底二次强杀,并以 exit 事件(进程死亡即发)解析,不依赖 close。
+		const hardKill = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* 已退出 */
+			}
+		}, (opts?.timeoutMs ?? APPEND_TIMEOUT_MS) + 1_000);
 		child.stdout?.on("data", (d) => {
 			out += String(d);
 		});
 		child.stderr?.on("data", (d) => {
 			err += String(d);
 		});
+		child.on("exit", (code) => finish(code ?? -1));
 		child.on("error", (e) => {
-			clearTimeout(timer);
-			resolve({ code: -1, out, err: String(e) });
-		});
-		child.on("close", (code) => {
-			clearTimeout(timer);
-			dumpSpawnEnvOnce(); // 首次调用即记录:对比 omp 内/外 delta 的运行环境(#11)
-			resolve({ code: code ?? -1, out, err });
+			finish(-1);
+			void e;
 		});
 		if (opts?.input !== undefined) child.stdin?.write(opts.input);
 		child.stdin?.end();
@@ -644,7 +658,15 @@ export default function ompDelta(pi: any) {
 		child.stderr?.on("data", () => {
 			/* 诊断输出 MVP 不消费 */
 		});
-		child.on("close", (code) => onClose(code));
+		// exit 而非 close:Windows 上孙进程握住管道时 close 永不触发(watch 断开误报为未断开)
+		child.on("exit", (code) => {
+			try {
+				rl.close();
+			} catch {
+				/* 已关闭 */
+			}
+			onClose(code ?? -1);
+		});
 		child.on("error", (e) => {
 			log("子进程启动失败: " + String(e));
 			onClose(-1);
