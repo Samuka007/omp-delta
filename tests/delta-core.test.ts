@@ -206,9 +206,12 @@ describe("parseJsonLines", () => {
 
 	it("falls back to whole-text JSON.parse for pretty-printed output (thread list shape)", () => {
 		const pretty = '[\n  {\n    "id": "ksQQaxtj",\n    "name": "manual probe"\n  },\n  {\n    "id": "ksQQg5RG",\n    "name": "probe"\n  }\n]';
+		// 整体 parse 的结果包一层:调用方(runDeltaJson 取末元素 / 调用侧 Array.isArray)按数组解包
 		assert.deepEqual(parseJsonLines(pretty), [
-			{ id: "ksQQaxtj", name: "manual probe" },
-			{ id: "ksQQg5RG", name: "probe" },
+			[
+				{ id: "ksQQaxtj", name: "manual probe" },
+				{ id: "ksQQg5RG", name: "probe" },
+			],
 		]);
 	});
 
