@@ -193,9 +193,18 @@ export function parseJsonLines(text: string): any[] {
 
 async function runDeltaJson(args: string[], opts?: { input?: string; timeoutMs?: number; cwd?: string }): Promise<any> {
 	const r = await runDelta(args, opts);
-	const js = parseJsonLines(r.out);
-	if (js.length === 0) {
+	try {
+		return runDeltaJsonFromText(r.out, r.err);
+	} catch {
 		throw new Error("delta " + args.join(" ") + " 无 JSON 输出: " + (r.err || r.out).slice(0, 400));
+	}
+}
+
+/** 已有原始输出时的 JSON 解析(JSONL 优先,整体 JSON 兜底)。 */
+function runDeltaJsonFromText(out: string, err: string): any {
+	const js = parseJsonLines(out).concat(parseJsonLines(err));
+	if (js.length === 0) {
+		throw new Error("no JSON in output: " + (err || out).slice(0, 400));
 	}
 	return js[js.length - 1];
 }
@@ -945,7 +954,17 @@ export default function ompDelta(pi: any) {
 	 *  的最近 omp 线程"(thread list → 逐个 status → worktrees 匹配 cwd)。
 	 *  权威在 DeltaDB,不依赖会话 id 的连续性 —— omp 的 continuation 链对它透明。 */
 	async function discoverBindingByCheckout(): Promise<{ threadId: string; worktreeRef?: string } | null> {
-		const list = await runDeltaJson(["thread", "list"], { cwd: rt.cwd });
+		const lr = await runDelta(["thread", "list"], { cwd: rt.cwd });
+		if (lr.code !== 0 || lr.out.trim().length === 0) {
+			log("discovery: thread list code=" + lr.code + " out=" + lr.out.slice(0, 200) + " err=" + lr.err.slice(0, 200));
+		}
+		const list = (() => {
+			try {
+				return runDeltaJsonFromText(lr.out, lr.err);
+			} catch {
+				return null;
+			}
+		})();
 		const rows: any[] = Array.isArray(list)
 			? list
 			: Array.isArray(list?.threads)
