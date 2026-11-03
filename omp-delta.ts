@@ -20,8 +20,6 @@
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 
@@ -34,6 +32,7 @@ const APPEND_TIMEOUT_MS = 30_000;
 const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
 const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible 供给窗口期:30s × 60 ≈ 30 分钟(实测可超 10 分钟)
+const MARKER_TYPE = "omp-delta.attachment"; // 写入 omp 会话的绑定标记(appendEntry,不进 LLM 上下文)
 
 type DeltaRecord = {
 	seq: number;
@@ -41,24 +40,25 @@ type DeltaRecord = {
 	update: Record<string, unknown>;
 };
 
-type State = {
-	connected: boolean;
-	threadId?: string;
-	worktreeRef?: string;
-	visibility?: "private" | "organization";
-	url?: string; // 真实 join 链接,来自 thread status(share id ≠ thread id)
-	seq: number; // 已分配的最大 sequence
-	lastAcked: number; // Delta 已确认的最大连续 sequence
-	titleSent: boolean;
-};
-
-/** 每个omp会话一份的运行时状态(工厂闭包持有,互不共享)。 */
+/** 每个omp会话一份的运行时状态(工厂闭包持有,互不共享;一切身份/游标均为内存态)。
+ *  权威:线程身份与送达游标在 DeltaDB,绑定关系在 omp session JSONL(MARKER_TYPE)。 */
 type Runtime = {
 	pi: any;
 	cwd: string;
 	sid: string;
 	isSub: boolean;
-	state: State;
+	connected: boolean;
+	// 线程身份(内存态)
+	threadId: string | null;
+	worktreeRef: string | null;
+	visibility: "private" | "organization" | null;
+	url: string | null;
+	titleSent: boolean;
+	// 送达游标(内存态;next_sequence 对齐后 seqReady 才放行 emit)
+	seq: number;
+	lastAcked: number;
+	pending: DeltaRecord[];
+	seqReady: boolean;
 	currentTurn: number | null; // running 记录的 seq;turn 内所有记录共用
 	paused: boolean;
 	retryAttempts: number;
@@ -174,6 +174,188 @@ async function resolveOrg(): Promise<{ id: string; name: string }> {
 	return { id, name: String(cur?.organization?.name ?? id) };
 }
 
+// ---- 纯函数接缝(可直接单测;合约语义见 docs/contract-notes.md) ----
+
+/** 实测回执形状:
+ *  {"operation":"appended","sequence":N,"next_sequence":N+1,"duplicate":false,
+ *   "disposition":"recorded","turn_sequence":3,"version":"…"}
+ *  确认结论在 disposition(recorded/duplicate/fenced);兼容旧式 status 字段。 */
+export function collectReceipts(j: any, into: Map<number, string>) {
+	const items: any[] = Array.isArray(j)
+		? j
+		: Array.isArray(j?.receipts)
+			? j.receipts
+			: j?.sequence !== undefined && (j?.disposition !== undefined || j?.status !== undefined)
+				? [j]
+				: [];
+	for (const it of items) {
+		const seq = Number(it?.sequence);
+		const st = String(it?.disposition ?? it?.status ?? "");
+		if (!Number.isFinite(seq) || !st) continue;
+		into.set(seq, it?.duplicate === true && st !== "fenced" ? "duplicate" : st);
+	}
+}
+
+/** 从 lastAcked 起找最大连续确认前缀(有空洞时不越过未确认记录)。
+ *  pending 只含未确认记录,bySeq 以它为准:超出 pending 的回执不能延长前缀。 */
+export function contiguousAck(pending: DeltaRecord[], lastAcked: number, receipts: Map<number, string>): number {
+	const acked = new Map<number, boolean>();
+	for (const [seq, st] of receipts) acked.set(seq, st === "recorded" || st === "duplicate");
+	const bySeq = new Map<number, DeltaRecord>();
+	for (const r of pending) bySeq.set(r.seq, r);
+	let seq = lastAcked;
+	while (acked.get(seq + 1) === true && bySeq.has(seq + 1)) seq += 1;
+	return seq;
+}
+
+export type AppendClassification = {
+	fenced: boolean;
+	retryable: boolean;
+	notVisible: boolean;
+	retryAfter: number;
+	errMsg: string;
+};
+
+/** 把 append 的退出码/输出/回执归类:接管、可重试、供给窗口、退避时长、错误消息。 */
+export function classifyAppendResult(
+	code: number,
+	err: string,
+	out: string,
+	receipts: Map<number, string>,
+): AppendClassification {
+	let fenced = false;
+	let retryable = false;
+	let notVisible = false;
+	let retryAfter = 5_000;
+	let errMsg = "";
+	for (const [, st] of receipts) if (st === "fenced") fenced = true;
+	if (code !== 0) {
+		for (const j of parseJsonLines(err).concat(parseJsonLines(out))) {
+			if (j?.error) {
+				errMsg = String(j.error.message ?? "").slice(0, 300) || (err || out).slice(0, 300);
+				if (j.error.retryable === true) {
+					retryable = true;
+					retryAfter = Number(j.error.retry_after_ms) || 5_000;
+				}
+				// 新线程的 history 供给窗口期(实测可达数十分钟):暂不可见但可自愈,
+				// 统一用 30s 长退避,不采信服务端短值
+				const reason = String(j.error.reason ?? "");
+				if (reason === "not_visible" || /history is unavailable/i.test(errMsg)) {
+					notVisible = true;
+					retryable = true;
+					retryAfter = 30_000;
+				}
+			}
+		}
+		// JSON 解析失败时的原始文本兑底:CLI 某些报错不带 JSON
+		const rawText = String(err || "") + String(out || "");
+		if (!retryable && !notVisible && /not_visible|history is unavailable/i.test(rawText)) {
+			notVisible = true;
+			retryable = true;
+			retryAfter = 30_000;
+			if (!errMsg) errMsg = "history not provisioned yet";
+		}
+		if (!errMsg) errMsg = (err || out || "exit " + code).slice(0, 300);
+	}
+	if (code === -1) {
+		// spawn 失败或超时被杀:没有 JSON 错误体,按可重试故障处理
+		retryable = true;
+		if (!errMsg) errMsg = "delta 进程无响应或被终止";
+	}
+	return { fenced, retryable, notVisible, retryAfter, errMsg };
+}
+
+/** append 请求体:每行一个 envelope,schemaVersion + sequence(+ turnSequence)。 */
+export function buildAppendEnvelope(pending: DeltaRecord[]): string {
+	return (
+		pending
+			.map((r) => {
+				const env: any = { schemaVersion: SCHEMA_VERSION, sequence: r.seq, update: r.update };
+				if (r.turnSequence !== undefined) env.turnSequence = r.turnSequence;
+				return JSON.stringify(env);
+			})
+			.join("\n") + (pending.length ? "\n" : "")
+	);
+}
+
+/** 供给窗口期错误:服务端尚未可见,可后台重试。 */
+export function isTransientProvisioning(msg: string): boolean {
+	return /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i.test(msg);
+}
+
+/** 参照 delta-claude:实时活动带 _meta.delta 来源标记,否则外部 producer 的 agent 输出不会被渲染进 transcript。 */
+export function liveActivity(update: Record<string, unknown>): Record<string, unknown> {
+	const kind = update.sessionUpdate;
+	const activityKind =
+		kind === "user_message" || kind === "agent_message" || kind === "agent_thought"
+			? String(kind)
+			: kind === "tool_call_update"
+				? "tool_call"
+				: undefined;
+	if (!activityKind) return update;
+	return {
+		...update,
+		_meta: {
+			delta: { work_origin: "external_agent", interaction_surface: "cli", activity_kind: activityKind },
+		},
+	};
+}
+
+/** 路径归一化比较(Windows/POSIX 分隔符与大小写)。 */
+function normPath(p: string): string {
+	return p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
+}
+
+// ---- 身份与游标:服务端为权威,本地不落盘 ----
+
+export type DeltaIdentity = {
+	threadId: string;
+	url: string;
+	visibility?: string;
+	externalId: string;
+	nextSequence: number;
+	worktrees: any[];
+};
+
+/** 从 `thread status` 解析可续录的线程身份。
+ *  注意:join url 是 share id(thread_01…),与 thread_id 无派生关系,只能取字段本身。 */
+export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
+	const threadId = String(status?.thread_id ?? "");
+	if (!threadId) return null;
+	return {
+		threadId,
+		url: String(status?.url ?? ""),
+		visibility: status?.visibility === "organization" ? "organization" : status?.visibility === "private" ? "private" : undefined,
+		externalId: String(status?.producer?.external_id ?? ""),
+		nextSequence: Number(status?.producer?.next_sequence ?? 0) || 0,
+		worktrees: Array.isArray(status?.worktrees?.items) ? status.worktrees.items : [],
+	};
+}
+
+export type WorktreePick = { ref: string; ambiguous: boolean };
+
+/** 从 worktree 列表里挑出当前 checkout 的身份;多个匹配必须报歧义,不静默选择。 */
+export function pickWorktreeForCwd(items: any[], cwd: string): WorktreePick {
+	const matches = items.filter((x) => {
+		const p = String(x?.path ?? x?.directory ?? "");
+		return p && normPath(p) === normPath(cwd);
+	});
+	if (matches.length > 1) return { ref: "", ambiguous: true };
+	return { ref: matches.length === 1 ? String(matches[0]?.reference ?? "") : "", ambiguous: false };
+}
+
+export type SequenceState = { pending: DeltaRecord[]; seq: number; lastAcked: number };
+
+/** 用服务端游标(next_sequence = 已送达条数)对齐本地队列:
+ *  丢掉服务端已有的记录,序列号从服务端游标继续 —— 重启/换机后零本地状态也能衔接。 */
+export function reconcileSequenceState(pending: DeltaRecord[], serverNext: number): SequenceState {
+	const cursor = Math.max(0, serverNext - 1); // 服务端已确认到的最大 seq
+	const kept = pending.filter((r) => r.seq > cursor);
+	let seq = cursor;
+	for (const r of kept) if (r.seq > seq) seq = r.seq;
+	return { pending: kept, seq, lastAcked: cursor };
+}
+
 // ---- 扩展工厂:每会话一份 Runtime ----
 
 export default function ompDelta(pi: any) {
@@ -182,7 +364,16 @@ export default function ompDelta(pi: any) {
 		cwd: process.cwd(),
 		sid: "",
 		isSub: false,
-		state: { connected: false, seq: 0, lastAcked: 0, titleSent: false },
+		connected: false,
+		threadId: null,
+		worktreeRef: null,
+		visibility: null,
+		url: null,
+		titleSent: false,
+		seq: 0,
+		lastAcked: 0,
+		pending: [],
+		seqReady: false,
 		currentTurn: null,
 		paused: false,
 		retryAttempts: 0,
@@ -213,168 +404,26 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	function stateDir(): string {
-		return path.join(os.homedir(), ".omp", "agent", "omp-delta", rt.sid || "unknown");
-	}
-
-	/** 路径归一化比较(Windows/POSIX 分隔符与大小写)。 */
-	function normPath(p: string): string {
-		return p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
-	}
-
-	function statePath(): string {
-		return path.join(stateDir(), "state.json");
-	}
-
-	function loadState() {
-		try {
-			const raw = fs.readFileSync(path.join(stateDir(), "state.json"), "utf8");
-			rt.state = { connected: false, seq: 0, lastAcked: 0, titleSent: false, ...JSON.parse(raw) };
-			// 进程重启后 mount/watch 子进程必然已死;线程身份保留,连接稍后重建
-			rt.state.connected = false;
-		} catch {
-			/* 首次运行,无状态文件 */
-		}
-	}
-
-	function saveState() {
-		let lastErr: unknown = null;
-		try {
-			fs.mkdirSync(stateDir(), { recursive: true });
-			const body = JSON.stringify(rt.state, null, 2);
-			// 原子写:writeFileSync 直接写会让并发读方看到半截/缺失的 state.json。
-			// Windows 上 rename 目标被 AV/索引器/并发读者短暂持有时 EPERM/EACCES。
-			// 策略:唯一 tmp 名先写;rename 失败不重试(内联重试会卡 omp 事件循环),
-			// 立即退化 copy+replace —— 保证 state.json 一旦存在就永不缺失,
-			// 最坏情况读者看到旧一拍的状态,无害。
-			const tmp = statePath() + "." + Date.now() + "-" + Math.random().toString(36).slice(2) + ".tmp";
-			try {
-				fs.writeFileSync(tmp, body);
-				try {
-					fs.renameSync(tmp, statePath());
-					return;
-				} catch (renameErr) {
-					// rename 被锁 → copy 兜底
-					lastErr = renameErr;
-				}
-			} catch (writeErr) {
-				lastErr = writeErr;
-			}
-			try { fs.unlinkSync(tmp); } catch { /* tmp 清理失败无害 */ }
-			// 兜底:copy+replace(非原子,但保证 state.json 一旦存在就永不缺失;
-			// 最坏情况读者看到旧一拍的状态,无害)
-			const tmp2 = statePath() + ".fallback-tmp";
-			fs.writeFileSync(tmp2, body);
-			fs.copyFileSync(tmp2, statePath());
-			try { fs.unlinkSync(tmp2); } catch { /* 无害 */ }
-			log("saveState: rename 失败,已用 copy 兜底(" + String(lastErr).slice(0, 120) + ")");
-		} catch (e) {
-			log("保存状态失败: " + String(e));
-		}
-	}
-
-	function outboxPath(): string {
-		return path.join(stateDir(), "outbox.jsonl");
-	}
-
 	function ready(): boolean {
-		return !rt.isSub && rt.state.connected && !!rt.state.threadId && !rt.paused;
+		return !rt.isSub && rt.connected && !!rt.threadId && !rt.paused;
 	}
 
 	function nextSeq(): number {
-		rt.state.seq += 1;
-		saveState();
-		return rt.state.seq;
+		rt.seq += 1;
+		return rt.seq;
 	}
 
-	/** 参照 delta-claude:实时活动带 _meta.delta 来源标记,否则外部 producer 的 agent 输出不会被渲染进 transcript。 */
-	function liveActivity(update: Record<string, unknown>): Record<string, unknown> {
-		const kind = update.sessionUpdate;
-		const activityKind =
-			kind === "user_message" || kind === "agent_message" || kind === "agent_thought"
-				? String(kind)
-				: kind === "tool_call_update"
-					? "tool_call"
-					: undefined;
-		if (!activityKind) return update;
-		return {
-			...update,
-			_meta: {
-				delta: { work_origin: "external_agent", interaction_surface: "cli", activity_kind: activityKind },
-			},
-		};
-	}
-
-	/** 分配 sequence、落 outbox、尝试推送。未连接时返回 null。 */
+	/** 分配 sequence、入队、尝试推送。游标未就绪或已暂停时返回 null。 */
 	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number; sequence?: number }): number | null {
-		// 门禁:有线程即可排队(离线时记录暂存,重连后续传——合约语义);
-		// connected 不作为门禁,否则建线程后的首条记录(让空线程上服务端)发不出去。
-		if (rt.isSub || rt.paused || !rt.state.threadId) return null;
+		// 门禁:游标就绪(已从服务端 next_sequence 对齐)才能发,否则序号必然重复/断裂。
+		// 记录只进内存队列:权威内容在 omp session JSONL,权威送达游标在服务端。
+		if (rt.isSub || rt.paused || !rt.seqReady || !rt.threadId) return null;
 		const seq = opts?.sequence ?? nextSeq();
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
-		try {
-			fs.mkdirSync(stateDir(), { recursive: true });
-			fs.appendFileSync(outboxPath(), JSON.stringify(rec) + "\n");
-		} catch (e) {
-			log("outbox 写入失败: " + String(e));
-			return seq;
-		}
+		rt.pending.push(rec);
 		void flush();
 		return seq;
-	}
-
-	// 实测回执形状(docs/contract-notes.md):
-	// {"operation":"appended","sequence":N,"next_sequence":N+1,"duplicate":false,
-	//  "disposition":"recorded","turn_sequence":3,"version":"…"}
-	// 确认结论在 disposition(recorded/duplicate/fenced);兼容旧式 status 字段。
-	function collectReceipts(j: any, into: Map<number, string>) {
-		const items: any[] = Array.isArray(j)
-			? j
-			: Array.isArray(j?.receipts)
-				? j.receipts
-				: j?.sequence !== undefined && (j?.disposition !== undefined || j?.status !== undefined)
-					? [j]
-					: [];
-		for (const it of items) {
-			const seq = Number(it?.sequence);
-			const st = String(it?.disposition ?? it?.status ?? "");
-			if (!Number.isFinite(seq) || !st) continue;
-			into.set(seq, it?.duplicate === true && st !== "fenced" ? "duplicate" : st);
-		}
-	}
-
-	/** 从 lastAcked 起找最大连续确认位(有空洞时不越过未确认记录)。 */
-	function contiguousAck(all: DeltaRecord[], receipts: Map<number, string>): number {
-		const acked = new Map<number, boolean>();
-		for (const [seq, st] of receipts) acked.set(seq, st === "recorded" || st === "duplicate");
-		const bySeq = new Map<number, DeltaRecord>();
-		for (const r of all) bySeq.set(r.seq, r);
-		let seq = rt.state.lastAcked;
-		while (acked.get(seq + 1) === true && bySeq.has(seq + 1)) seq += 1;
-		return seq;
-	}
-
-	/** 已确认的记录从 outbox 文件里清掉,避免无限增长。
-	 *  必须重新读文件:flush 的 await 期间 emit 可能追加了新记录,用旧快照重写会抹掉它们。 */
-	function compactOutbox() {
-		try {
-			const raw = fs.readFileSync(outboxPath(), "utf8");
-			const keep: string[] = [];
-			for (const line of raw.split(/\r?\n/)) {
-				const t = line.trim();
-				if (!t) continue;
-				try {
-					const rec = JSON.parse(t) as DeltaRecord;
-					if (rec.seq > rt.state.lastAcked) keep.push(t);
-				} catch {
-					keep.push(t); // 坏行原样保留,不静默丢弃
-				}
-			}
-			fs.writeFileSync(outboxPath(), keep.join("\n") + (keep.length ? "\n" : ""));
-		} catch (e) {
-			log("outbox 压缩失败: " + String(e));
-		}
 	}
 
 	let flushing = false;
@@ -388,48 +437,25 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	/** 把 outbox 里所有未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
+	/** 把未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
 	async function flush(): Promise<void> {
-		if (!rt.state.threadId || flushing || rt.paused) return;
+		if (!rt.threadId || flushing || rt.paused) return;
 		flushing = true;
 		try {
-			let raw = "";
-			try {
-				raw = fs.readFileSync(outboxPath(), "utf8");
-			} catch {
-				return; // 还没有任何记录
-			}
-			const all: DeltaRecord[] = [];
-			for (const line of raw.split(/\r?\n/)) {
-				const t = line.trim();
-				if (!t) continue;
-				try {
-					all.push(JSON.parse(t));
-				} catch {
-					/* 跳过坏行 */
-				}
-			}
-			const pending = all.filter((r) => r.seq > rt.state.lastAcked);
+			const pending = rt.pending.filter((r) => r.seq > rt.lastAcked);
 			if (pending.length === 0) {
 				rt.retryAttempts = 0;
 				return;
 			}
 
-			// 重发已确认记录安全(Delta 返回 duplicate),故每次推送全部 pending
-			const body =
-				pending
-					.map((r) => {
-						const env: any = { schemaVersion: SCHEMA_VERSION, sequence: r.seq, update: r.update };
-						if (r.turnSequence !== undefined) env.turnSequence = r.turnSequence;
-						return JSON.stringify(env);
-					})
-					.join("\n") + "\n";
+			// 已确认记录已从队列移除;重发未确认记录安全(Delta 返回 duplicate)
+			const body = buildAppendEnvelope(pending);
 
 			const r = await runDelta(
 				[
 					"thread",
 					"append",
-					String(rt.state.threadId),
+					rt.threadId,
 					"--source",
 					SOURCE,
 					"--external-id",
@@ -444,50 +470,14 @@ export default function ompDelta(pi: any) {
 			for (const j of parseJsonLines(r.out)) collectReceipts(j, receipts);
 			if (r.code !== 0) for (const j of parseJsonLines(r.err)) collectReceipts(j, receipts);
 
-			let fenced = false;
-			let retryable = false;
-			let notVisible = false;
-			let retryAfter = 5_000;
-			let errMsg = "";
-			for (const [, st] of receipts) if (st === "fenced") fenced = true;
-			if (r.code !== 0) {
-				for (const j of parseJsonLines(r.err).concat(parseJsonLines(r.out))) {
-					if (j?.error) {
-						errMsg = String(j.error.message ?? "").slice(0, 300) || (r.err || r.out).slice(0, 300);
-						if (j.error.retryable === true) {
-							retryable = true;
-							retryAfter = Number(j.error.retry_after_ms) || 5_000;
-						}
-						// 新线程的 history 供给窗口期(可达数分钟):暂不可见但可自愈,单独用长预算重试
-						const reason = String(j.error.reason ?? "");
-						if (reason === "not_visible" || /history is unavailable/i.test(errMsg)) {
-							notVisible = true;
-							retryable = true;
-							retryAfter = 30_000;
-						}
-					}
-				}
-				// JSON 解析失败时的原始文本兑底:CLI 某些报错不带 JSON
-				const rawText = String(r.err || "") + String(r.out || "");
-				if (!retryable && !notVisible && /not_visible|history is unavailable/i.test(rawText)) {
-					notVisible = true;
-					retryable = true;
-					retryAfter = 30_000;
-					if (!errMsg) errMsg = "history not provisioned yet";
-				}
-				if (!errMsg) errMsg = (r.err || r.out || "exit " + r.code).slice(0, 300);
-			}
-			if (r.code === -1) {
-				// spawn 失败或超时被杀:没有 JSON 错误体,按可重试故障处理
-				retryable = true;
-				if (!errMsg) errMsg = "delta 进程无响应或被终止";
-			}
+			const cls = classifyAppendResult(r.code, r.err, r.out, receipts);
 
-			if (fenced) {
+			if (cls.fenced) {
 				// 该 turn 已被他人接管:合约要求停止本地 turn(已执行的工具效果无法撤销)
 				notify("Delta:该 turn 已被他人接管,本地 turn 已停止。", "warning");
-				rt.state.lastAcked = Math.max(rt.state.lastAcked, contiguousAck(all, receipts));
-				saveState();
+				const ack = contiguousAck(pending, rt.lastAcked, receipts);
+				rt.lastAcked = Math.max(rt.lastAcked, ack);
+				rt.pending = rt.pending.filter((rec) => rec.seq > rt.lastAcked);
 				rt.currentTurn = null;
 				try {
 					lastCtx?.abort?.();
@@ -497,40 +487,40 @@ export default function ompDelta(pi: any) {
 				return;
 			}
 
-			const newAck = contiguousAck(all, receipts);
-			if (newAck > rt.state.lastAcked) {
-				rt.state.lastAcked = newAck;
-				saveState();
+			const newAck = contiguousAck(pending, rt.lastAcked, receipts);
+			if (newAck > rt.lastAcked) {
+				rt.lastAcked = newAck;
+				// 已确认记录出队(内存队列,无需落盘)
+				rt.pending = rt.pending.filter((rec) => rec.seq > rt.lastAcked);
 				rt.retryAttempts = 0;
 				rt.historyWaitAttempts = 0;
-				compactOutbox();
 			}
 
-			if (r.code !== 0 && rt.state.lastAcked < rt.state.seq) {
-				if (retryable && notVisible && rt.historyWaitAttempts < MAX_HISTORY_WAIT_ATTEMPTS) {
+			if (r.code !== 0 && rt.lastAcked < rt.seq) {
+				if (cls.retryable && cls.notVisible && rt.historyWaitAttempts < MAX_HISTORY_WAIT_ATTEMPTS) {
 					rt.historyWaitAttempts += 1;
 					notify(
 						"Delta 线程供给中,等待可见("
-						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + errMsg,
+						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + cls.errMsg,
 					);
 					schedule(() => {
 						void flush();
-					}, retryAfter);
-				} else if (retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
+					}, cls.retryAfter);
+				} else if (cls.retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
 					rt.retryAttempts += 1;
 					notify(
-						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + errMsg + ")",
+						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + cls.errMsg + ")",
 						"warning",
 					);
 					schedule(() => {
 						void flush();
-					}, retryAfter);
+					}, cls.retryAfter);
 				} else {
 					rt.paused = true;
-					notify("Delta 推送失败,已暂停自动重试:" + errMsg + "(用 /delta-retry 恢复)", "warning");
+					notify("Delta 推送失败,已暂停自动重试:" + cls.errMsg + "(用 /delta-retry 恢复)", "warning");
 				}
 			}
-			if (r.code === 0 && rt.state.lastAcked < rt.state.seq) {
+			if (r.code === 0 && rt.lastAcked < rt.seq) {
 				// 部分确认:安排跟进推送;连续无进展则暂停(计数由有进展时归零)
 				if (rt.retryAttempts < MAX_AUTO_RETRIES) {
 					rt.retryAttempts += 1;
@@ -621,7 +611,7 @@ export default function ompDelta(pi: any) {
 			[
 				"thread",
 				"watch",
-				String(rt.state.threadId),
+				String(rt.threadId),
 				"--source",
 				SOURCE,
 				"--external-id",
@@ -632,7 +622,7 @@ export default function ompDelta(pi: any) {
 			(j) => handleWatchEvent(j),
 			(code) => {
 				rt.watchChild = null;
-				if (!rt.detaching && rt.state.connected) {
+				if (!rt.detaching && rt.connected) {
 					notify("Delta watch 断开(exit " + code + "),评论回流暂停;/delta-retry 可重连。", "warning");
 				}
 			},
@@ -642,9 +632,9 @@ export default function ompDelta(pi: any) {
 	/** 已有线程:挂载 worktree + 启动 watch + 推送积压记录。 */
 	async function attachAndStream(): Promise<void> {
 		rt.detaching = false;
-		const ref = String(rt.state.worktreeRef ?? "");
+		const ref = String(rt.worktreeRef ?? "");
 		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
-		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
+		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		let a = a0;
 		// 新线程的 history/worktree 供给需要数秒到数分钟;这些签名都可退避重试:
 		// not in this account / invalid_reference(服务端还没见到线程)、history is unavailable(供给窗口)
@@ -655,21 +645,11 @@ export default function ompDelta(pi: any) {
 				const t = (rt.eventCtx ?? lastCtx)?.setTimeout?.(r, 3_000);
 				if (!t) setTimeout(r, 3_000);
 			});
-			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.state.threadId)], { cwd: rt.cwd });
+			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		}
-		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用。
-		// 若 state 是别的目录写入的(跨目录 autoResume),复用必然错配,给出明确指引而非哑错误。
-		if (a.code !== 0) {
-			const attachBlob = String(a.err || a.out);
-			if (!attachBlob.includes("already has a worktree")) {
-				throw new Error("worktree attach 失败: " + attachBlob.slice(0, 300));
-			}
-			if (rt.state.cwd && normPath(rt.state.cwd) !== normPath(rt.cwd)) {
-				throw new Error(
-					"线程绑定的是 " + rt.state.cwd + " 的 checkout,当前目录是 " + rt.cwd
-						+ ";请在当前目录重新 /delta-share(旧线程保留在 Delta)。",
-				);
-			}
+		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用
+		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
+			throw new Error("worktree attach 失败: " + String(a.err || a.out).slice(0, 300));
 		}
 
 		// mount 上传 checkout 并持续同步;ready 行出现即继续,进程保持运行
@@ -686,7 +666,7 @@ export default function ompDelta(pi: any) {
 				() => settle(),
 				(code) => {
 					rt.mountChild = null;
-					if (!rt.detaching && rt.state.connected) {
+					if (!rt.detaching && rt.connected) {
 						notify("Delta worktree 同步进程退出(exit " + code + ")。", "warning");
 					}
 				},
@@ -695,26 +675,10 @@ export default function ompDelta(pi: any) {
 			schedule(() => settle(), MOUNT_READY_TIMEOUT_MS);
 		});
 
-		rt.state.connected = true;
+		rt.connected = true;
 		rt.connectAttempts = 0;
-		saveState();
 		startWatch();
 		void flush();
-
-		// join 链接用的是 share id(thread_01…),不是 thread create 返回的 id,只能问 status
-		try {
-			const st = await runDeltaJson(
-				["thread", "status", String(rt.state.threadId), "--source", SOURCE, "--external-id", rt.sid],
-				{ cwd: rt.cwd },
-			);
-			const url = String(st?.url ?? "");
-			if (url && url !== rt.state.url) {
-				rt.state.url = url;
-				saveState();
-			}
-		} catch {
-			/* 拿不到 url 不影响同步 */
-		}
 	}
 
 	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
@@ -757,16 +721,28 @@ export default function ompDelta(pi: any) {
 			],
 			{ cwd: rt.cwd },
 		);
-		rt.state.threadId = String(created?.thread_id ?? "");
-		rt.state.visibility = mode;
-		saveState(); // threadId 先落盘:后续任一步失败都能凭它幂等重连
-		if (!rt.state.threadId) {
+		// 身份与游标:thread create 幂等(source+external-id 相同即同一线程),
+		// status 提供 join url 与服务端游标;全部以服务端为权威,不落盘。
+		rt.threadId = String(created?.thread_id ?? "");
+		rt.visibility = mode;
+		if (!rt.threadId) {
 			throw new Error("thread create 未返回 thread_id: " + JSON.stringify(created).slice(0, 300));
 		}
+		const st = await runDeltaJson(
+			["thread", "status", rt.threadId, "--source", SOURCE, "--external-id", rt.sid],
+			{ cwd: rt.cwd },
+		);
+		const id = resolveIdentityFromStatus(st);
+		rt.url = id?.url ?? null;
+		const rc = reconcileSequenceState(rt.pending, id?.nextSequence ?? 0);
+		rt.pending = rc.pending;
+		rt.seq = rc.seq;
+		rt.lastAcked = rc.lastAcked;
+		rt.seqReady = true;
+
 		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
-		if (!rt.state.titleSent) {
-			rt.state.titleSent = true;
-			saveState();
+		if (!rt.titleSent) {
+			rt.titleSent = true;
 			let title = "";
 			try {
 				title = String((await pi?.getSessionName?.()) ?? "");
@@ -777,45 +753,44 @@ export default function ompDelta(pi: any) {
 		}
 
 		// worktree 身份(参考 delta-claude checkoutReference 语义):
-		// list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报错让人选;
-		// 创建/复用后立即落盘,防崩溃孤儿引用。
-		let ref = "";
+		// list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报歧义让人选。
 		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
 		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
-		const norm = (s: string) => s.replace(/[\\/]+$/, "").toLowerCase();
-		const matches = rows.filter((x) => {
-			const p = String(x?.path ?? x?.directory ?? "");
-			return p && norm(p) === norm(rt.cwd);
-		});
-		if (matches.length > 1) {
+		const pick = pickWorktreeForCwd(rows, rt.cwd);
+		if (pick.ambiguous) {
 			throw new Error("该 checkout 存在多个 worktree 身份,请先在 Delta 里选择正确的一个后重试。");
 		}
-		if (matches.length === 1) {
-			ref = String(matches[0]?.reference ?? "");
-		}
+		let ref = pick.ref;
 		if (!ref) {
 			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
 			ref = String(w?.reference ?? "");
 		}
 		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
-		rt.state.worktreeRef = ref;
-		rt.state.cwd = rt.cwd; // 记录绑定时的目录:autoResume 换目录启动时可检测错配
-		saveState();
+		rt.worktreeRef = ref;
 
 		await attachAndStream();
 
+		// 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
+		// 重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录。
+		try {
+			pi?.appendEntry?.(MARKER_TYPE, {
+				threadId: rt.threadId,
+				worktreeRef: rt.worktreeRef,
+				visibility: rt.visibility,
+				cwd: rt.cwd,
+				sharedAt: new Date().toISOString(),
+			});
+		} catch {
+			/* 标记失败不影响本次连接;下次需手动 /delta-share */
+		}
+
 		notify(
 			"Delta 线程已连接:" +
-				rt.state.threadId +
+				rt.threadId +
 				"\n浏览器打开: " +
-				(rt.state.url ?? "https://delta.dev/join/" + rt.state.threadId) +
+				(rt.url ?? "https://delta.dev/join/" + rt.threadId) +
 				"\n(对话与工作区文件,含未提交改动,正在同步到 Delta)",
 		);
-	}
-
-	/** 供给窗口期错误:服务端尚未可见,可后台重试。 */
-	function isTransientProvisioning(msg: string): boolean {
-		return /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i.test(msg);
 	}
 
 	/** 后台重试连接(供给窗口期实测可达 10+ 分钟,预算 40×30s)。 */
@@ -843,9 +818,46 @@ export default function ompDelta(pi: any) {
 		rt.mountChild = null;
 		killChild(rt.watchChild);
 		rt.watchChild = null;
-		rt.state.connected = false;
-		saveState();
+		rt.connected = false;
 		if (!quiet) notify("已断开 Delta 同步(线程与已上传内容保留)。");
+	}
+
+	/** 凭会话标记重连:status 校验 external_id(防 fork 静默续录)→ 对齐服务端游标 → attach。
+	 *  身份权威在 DeltaDB:status 失败/线程不属于本会话时给明确指引,不静默重建。 */
+	async function reconnectByIdentity(marker: { threadId: string; worktreeRef?: string }): Promise<void> {
+		try {
+			const st = await runDeltaJson(
+				["thread", "status", String(marker.threadId), "--source", SOURCE, "--external-id", rt.sid],
+				{ cwd: rt.cwd },
+			);
+			const id = resolveIdentityFromStatus(st);
+			if (!id) throw new Error("thread status 未返回 thread_id");
+			if (id.externalId && id.externalId !== rt.sid) {
+				notify(
+					"该 Delta 线程绑定的是会话 " + id.externalId + "(本会话可能是 fork);如需同步请 /delta-share 重新连接。",
+					"warning",
+				);
+				return;
+			}
+			rt.threadId = id.threadId;
+			rt.url = id.url || null;
+			rt.visibility = id.visibility as Runtime["visibility"];
+			const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
+			if (pick.ambiguous) {
+				notify("该线程挂了多个 worktree 身份,请 /delta-share 重新绑定。", "warning");
+				return;
+			}
+			rt.worktreeRef = pick.ref || String(marker.worktreeRef ?? "");
+			const rc = reconcileSequenceState(rt.pending, id.nextSequence);
+			rt.pending = rc.pending;
+			rt.seq = rc.seq;
+			rt.lastAcked = rc.lastAcked;
+			rt.seqReady = true;
+			await attachAndStream();
+			notify("Delta 已重连: " + (rt.url ?? rt.threadId));
+		} catch (e) {
+			notify("Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)", "warning");
+		}
 	}
 
 	// ---- 事件与命令注册 ----
@@ -859,8 +871,8 @@ export default function ompDelta(pi: any) {
 				notify("子代理会话暂不支持连接 Delta。", "warning");
 				return;
 			}
-			if (rt.state.connected) {
-				notify("已连接:" + rt.state.threadId);
+			if (rt.connected) {
+				notify("已连接:" + rt.threadId);
 				return;
 			}
 			const mode: "private" | "organization" = String(args ?? "").trim().toLowerCase().startsWith("priv")
@@ -868,8 +880,9 @@ export default function ompDelta(pi: any) {
 				: "organization";
 			// 合约要求：共享前必须征得用户同意，并告知可见范围（组织名+内容）
 			let ok = true;
+			let org: { id: string; name: string };
 			try {
-				const org = await resolveOrg();
+				org = await resolveOrg();
 				if (typeof ctx?.ui?.confirm === "function") {
 					ok = await ctx.ui.confirm(
 						mode === "private" ? "连接 Delta（私有线程）？" : "连接 Delta 并把会话共享给组织？",
@@ -884,7 +897,11 @@ export default function ompDelta(pi: any) {
 					notify("已取消，未创建 Delta 线程。");
 					return;
 				}
-				try {
+			} catch (e) {
+				notify("准备连接失败：" + String(e instanceof Error ? e.message : e), "warning");
+				return;
+			}
+			try {
 				await connectShared(mode, org);
 			} catch (e) {
 				const msg = String(e instanceof Error ? e.message : e);
@@ -906,14 +923,13 @@ export default function ompDelta(pi: any) {
 		description: "查看 omp-delta 连接与同步状态",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
-			const s = rt.state;
 			const lines = [
-				"连接: " + (s.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
-				"线程: " + (s.threadId ?? "无"),
-				s.threadId ? "可见性: " + (s.visibility ?? "未知") : "",
-				s.threadId ? "链接: " + (s.url ?? "(尚未获取,重连后自动更新)") : "",
-				"记录: 已分配 " + s.seq + " 条,已确认 " + s.lastAcked + " 条",
-				"worktree: " + (s.worktreeRef ?? "无"),
+				"连接: " + (rt.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
+				"线程: " + (rt.threadId ?? "无"),
+				rt.threadId ? "可见性: " + (rt.visibility ?? "未知") : "",
+				rt.threadId ? "链接: " + (rt.url ?? "(尚未获取,重连后自动更新)") : "",
+				"记录: 已分配 " + rt.seq + " 条,已确认 " + rt.lastAcked + " 条,待发 " + rt.pending.length + " 条",
+				"worktree: " + (rt.worktreeRef ?? "无"),
 				"mount/watch: " + (rt.mountChild ? "运行中" : "停止") + " / " + (rt.watchChild ? "运行中" : "停止"),
 				"会话: " + (rt.isSub ? "子代理(不记录)" : "主会话") + " · " + rt.sid,
 			].filter(Boolean);
@@ -925,7 +941,7 @@ export default function ompDelta(pi: any) {
 		description: "断开 Delta 同步(保留线程与已上传内容)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
-			if (!rt.state.threadId) {
+			if (!rt.threadId) {
 				notify("尚未连接 Delta。");
 				return;
 			}
@@ -940,14 +956,31 @@ export default function ompDelta(pi: any) {
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			rt.paused = false;
 			rt.retryAttempts = 0;
-			if (rt.state.threadId && !rt.state.connected) {
-				notify("尝试重连 Delta 线程 " + rt.state.threadId + " …");
+			if (rt.threadId && !rt.connected) {
+				notify("尝试重连 Delta 线程 " + rt.threadId + " …");
 				try {
 					await attachAndStream();
 					notify("已重连。");
 				} catch (e) {
 					notify("重连失败:" + String(e instanceof Error ? e.message : e), "warning");
 					return;
+				}
+			} else if (!rt.threadId) {
+				// 进程重启后内存为空:凭会话标记重连(无标记则提示 /delta-share)
+				let marker: any = null;
+				try {
+					const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
+					for (const e of entries) {
+						if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) marker = e.data;
+					}
+				} catch {
+					/* 无会话读取能力 */
+				}
+				if (marker?.threadId) {
+					notify("凭会话标记重连 Delta 线程 " + marker.threadId + " …");
+					await reconnectByIdentity(marker);
+				} else {
+					notify("尚未绑定 Delta 线程;用 /delta-share 连接。");
 				}
 			} else {
 				void flush();
@@ -962,24 +995,27 @@ export default function ompDelta(pi: any) {
 		if (rt.isSub) return;
 		rt.sid = String(ctx?.sessionManager?.getSessionId?.() ?? "sess-" + randomUUID());
 		rt.cwd = String(ctx?.cwd ?? process.cwd());
-		loadState();
-		if (rt.state.threadId) {
+		// 绑定标记在 omp 会话记录里(appendEntry 写入,生命周期归 omp 管):
+		// 有标记 → 后台凭它重连;无标记 → 等用户显式 /delta-share。
+		let marker: any = null;
+		try {
+			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
+			for (const e of entries) {
+				if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) marker = e.data;
+			}
+		} catch {
+			/* 无会话读取能力时只能手动 /delta-share */
+		}
+		if (marker?.threadId) {
 			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连
-			notify("发现已有 Delta 线程 " + rt.state.threadId + ",后台重连中…");
-			void attachAndStream().then(
-				() => notify("Delta 已重连: " + (rt.state.url ?? rt.state.threadId)),
-				(e: unknown) =>
-					notify(
-						"Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)",
-						"warning",
-					),
-			);
+			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
+			void reconnectByIdentity(marker);
 		}
 	});
 
 	pi.on("session_switch", async () => {
-		if (rt.isSub || !rt.state.threadId) return;
-		if (rt.state.connected || rt.mountChild || rt.watchChild) {
+		if (rt.isSub || !rt.threadId) return;
+		if (rt.connected || rt.mountChild || rt.watchChild) {
 			detach(true);
 			notify("会话已切换,Delta 同步已停止;新会话可用 /delta-share 重新连接。");
 		}
@@ -990,9 +1026,8 @@ export default function ompDelta(pi: any) {
 		const text = String(event?.text ?? event?.prompt ?? "").trim();
 		if (!text) return;
 		if (text.startsWith("/")) return; // slash 命令不是对话内容,不记录
-		if (!rt.state.titleSent) {
-			rt.state.titleSent = true;
-			saveState();
+		if (!rt.titleSent) {
+			rt.titleSent = true;
 			let title = "";
 			try {
 				title = String((await pi?.getSessionName?.()) ?? "");
@@ -1003,7 +1038,7 @@ export default function ompDelta(pi: any) {
 		}
 		emit({
 			sessionUpdate: "user_message",
-			messageId: "u" + (rt.state.seq + 1),
+			messageId: "u" + (rt.seq + 1),
 			content: [{ type: "text", text }],
 		});
 	});
@@ -1037,7 +1072,7 @@ export default function ompDelta(pi: any) {
 		emit(
 			{
 				sessionUpdate: "agent_message",
-				messageId: "a" + (rt.state.seq + 1),
+				messageId: "a" + (rt.seq + 1),
 				content: [{ type: "text", text }],
 			},
 			rt.currentTurn !== null ? { turnSequence: rt.currentTurn } : undefined,
@@ -1070,7 +1105,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("session_shutdown", () => {
-		// 处理器只有 2s 预算:只做同步清理,不等待 CLI 调用
+		// 处理器只有 2s 预算:只做同步清理,不等待 CLI 调用;无状态需要落盘(零本地状态)
 		try {
 			killChild(rt.mountChild);
 			killChild(rt.watchChild);
@@ -1079,6 +1114,5 @@ export default function ompDelta(pi: any) {
 		}
 		rt.mountChild = null;
 		rt.watchChild = null;
-		saveState();
 	});
 }
