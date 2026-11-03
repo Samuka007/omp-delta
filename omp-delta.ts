@@ -1038,6 +1038,8 @@ export default function ompDelta(pi: any) {
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			rt.paused = false;
 			rt.retryAttempts = 0;
+			rt.historyWaitAttempts = 0; // 供给窗口可能超过旧预算:手动重试必须重新武装长预算
+			rt.connectAttempts = 0;
 			if (rt.threadId && !rt.connected) {
 				notify("尝试重连 Delta 线程 " + rt.threadId + " …");
 				try {
