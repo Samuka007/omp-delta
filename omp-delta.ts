@@ -165,7 +165,7 @@ function runDelta(
 	});
 }
 
-function parseJsonLines(text: string): any[] {
+export function parseJsonLines(text: string): any[] {
 	const result: any[] = [];
 	for (const line of text.split(/\r?\n/)) {
 		const t = line.trim();
@@ -174,6 +174,18 @@ function parseJsonLines(text: string): any[] {
 			result.push(JSON.parse(t));
 		} catch {
 			/* 非 JSON 行,忽略 */
+		}
+	}
+	// 兜底:thread list 等“JSON 但 pretty-printed”的输出整体不是 JSONL,
+	// 逐行解析会颗粒无收 —— 能整体 parse 时按单值返回
+	if (result.length === 0) {
+		const t = text.trim();
+		if (t.startsWith("[") || t.startsWith("{")) {
+			try {
+				result.push(JSON.parse(t));
+			} catch {
+				/* 输出不是合法 JSON */
+			}
 		}
 	}
 	return result;
@@ -944,6 +956,7 @@ export default function ompDelta(pi: any) {
 		const sorted = rows
 			.slice()
 			.sort((a, b) => String(b?.created_at_utc ?? "").localeCompare(String(a?.created_at_utc ?? "")));
+		log("discovery: rows=" + rows.length + " probing top " + Math.min(8, sorted.length) + " cwd=" + rt.cwd);
 		for (const row of sorted.slice(0, 8)) {
 			const tid = String(row?.id ?? "");
 			if (!tid) continue;
@@ -953,13 +966,18 @@ export default function ompDelta(pi: any) {
 					{ cwd: rt.cwd },
 				);
 				const id = resolveIdentityFromStatus(st);
-				if (!id) continue;
+				if (!id) {
+					log("discovery: " + tid.slice(0, 12) + " no identity");
+					continue;
+				}
 				const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
+				log("discovery: " + tid.slice(0, 12) + " wtDirs=" + JSON.stringify(id.worktrees).slice(0, 260) + " pick=" + JSON.stringify(pick));
 				if (pick.ref && !pick.ambiguous) return { threadId: tid, worktreeRef: pick.ref };
-			} catch {
-				/* 该候选不可见/不属于我们:试下一个 */
+			} catch (e) {
+				log("discovery: " + tid.slice(0, 12) + " status failed: " + String(e).slice(0, 160));
 			}
 		}
+		log("discovery: no match");
 		return null;
 	}
 

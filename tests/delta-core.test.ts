@@ -7,6 +7,7 @@ import {
 	contiguousAck,
 	isTransientProvisioning,
 	liveActivity,
+	parseJsonLines,
 } from "../omp-delta.ts";
 
 describe("collectReceipts", () => {
@@ -195,5 +196,23 @@ describe("liveActivity", () => {
 	it("leaves unmarked updates untouched", () => {
 		const update = { sessionUpdate: "state_update", state: "running" };
 		assert.equal(liveActivity(update), update); // 同一引用:无 _meta 时原样返回
+	});
+});
+
+describe("parseJsonLines", () => {
+	it("parses JSONL lines", () => {
+		assert.deepEqual(parseJsonLines('{"a":1}\n{"a":2}\n'), [{ a: 1 }, { a: 2 }]);
+	});
+
+	it("falls back to whole-text JSON.parse for pretty-printed output (thread list shape)", () => {
+		const pretty = '[\n  {\n    "id": "ksQQaxtj",\n    "name": "manual probe"\n  },\n  {\n    "id": "ksQQg5RG",\n    "name": "probe"\n  }\n]';
+		assert.deepEqual(parseJsonLines(pretty), [
+			{ id: "ksQQaxtj", name: "manual probe" },
+			{ id: "ksQQg5RG", name: "probe" },
+		]);
+	});
+
+	it("returns empty for non-JSON output", () => {
+		assert.deepEqual(parseJsonLines("delta: some human text\nmore text"), []);
 	});
 });
