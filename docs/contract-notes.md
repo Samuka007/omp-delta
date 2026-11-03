@@ -59,8 +59,7 @@ own records!) — count `"type":"item"` frames per kind.
 
 ## Windows notes
 
-- `state.json` writes must be atomic (tmp + rename): the extension saves constantly, and
-  readers otherwise observe missing or half-written files.
+- ~~`state.json` writes must be atomic (tmp + rename)~~ Obsolete since the zero-local-state redesign (#10): the extension no longer writes any state files — identity lives in the omp session record, the delivery cursor is the server's `next_sequence`.
 - Git Bash mangles leading-`/` arguments (MSYS path conversion) — set `MSYS_NO_PATHCONV=1`
   when invoking the CLI from bash with thread ids or paths; the same applies to paths passed
   to `herdr workspace create` (or use `E:/style` paths).

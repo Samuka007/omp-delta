@@ -9,8 +9,8 @@ A community implementation of the [officially documented plugin contract](https:
 - `/delta-share` — connect the current omp session to a Delta thread: create thread (idempotent) → attach + mount the worktree (including uncommitted changes) → share with your organization (confirmation first)
 - Records automatically from then on: user input, turn start/stop, assistant replies, tool calls — watchable live in the Delta app or browser
 - Teammate comments in Delta flow back into omp context as follow-ups (never auto-trigger a turn)
-- If someone takes over the thread, the local turn stops (`superseded` / `fenced`)
-- Local outbox keeps every record until Delta confirms it; retryable failures back off automatically
+- Someone takes over the thread → the local turn stops (`superseded` / `fenced`)
+- Zero local state: thread identity lives in the omp session record + DeltaDB, the delivery cursor is the server's `next_sequence`; undelivered records queue in memory and retryable failures back off automatically
 - `/delta-status`, `/delta-detach`, `/delta-retry` for connection management
 
 ## Install
@@ -25,10 +25,11 @@ Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp runn
 ## Known limits (MVP)
 
 - Main session only; omp subagents → Delta child threads not yet implemented
-- No history backfill: recording starts when you connect
+- No history backfill: recording starts when you connect; records emitted before the server cursor is known are dropped
 - Thinking blocks and streaming deltas are not recorded; tool cards carry name/status only
 - Sharing targets the currently selected organization (`delta org current`)
 - Switching sessions (`/new`) stops sync — run `/delta-share` again in the new session
+- After an omp restart, reconnect happens automatically from the session binding marker (via `/delta-retry` if the background attempt gives up)
 
 ## Roadmap
 

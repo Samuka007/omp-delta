@@ -3,7 +3,7 @@
  *
  * 实现官方插件合约中属于插件一侧的四件事(delta.dev/docs/cli/build-a-plugin):
  *   1. 把 omp 活动翻译成 Delta 记录并推送(thread append,ACP v2 update)
- *   2. 记录先落本地 outbox,Delta 确认前不删;重发安全(返回 duplicate)
+ *   2. 记录只进内存队列,由服务端 next_sequence 对齐游标;已确认即出队;重发安全(返回 duplicate)
  *   3. thread watch 把队友评论回流进 omp 上下文(follow-up,不自动触发 turn)
  *   4. 线程被他人接管时(superseded / fenced)停止本地 turn
  *
@@ -14,7 +14,9 @@
  *
  * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
  * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
- * 模块层只保留无状态的 Delta CLI 进程封装。
+ * 模块层只保留无状态的 Delta CLI 进程封装与可单测的纯函数接缝。
+ * 零本地状态(#10):线程身份以 DeltaDB 为权威,绑定关系写在 omp 会话记录里
+ * (appendEntry 自定义条目),送达游标以服务端 next_sequence 为权威。
  *
  * 安装:复制本文件到 ~/.omp/agent/extensions/omp-delta.ts,重启 omp。
  */
@@ -33,6 +35,9 @@ const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
 const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible 供给窗口期:30s × 60 ≈ 30 分钟(实测可超 10 分钟)
 const MARKER_TYPE = "omp-delta.attachment"; // 写入 omp 会话的绑定标记(appendEntry,不进 LLM 上下文)
+// 供给窗口期签名:append 错误分类与连接重试共用一套,保持同步
+const NOT_VISIBLE_RE = /not_visible|history is unavailable/i;
+const PROVISIONING_RE = /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i;
 
 type DeltaRecord = {
 	seq: number;
@@ -240,7 +245,7 @@ export function classifyAppendResult(
 				// 新线程的 history 供给窗口期(实测可达数十分钟):暂不可见但可自愈,
 				// 统一用 30s 长退避,不采信服务端短值
 				const reason = String(j.error.reason ?? "");
-				if (reason === "not_visible" || /history is unavailable/i.test(errMsg)) {
+				if (reason === "not_visible" || NOT_VISIBLE_RE.test(errMsg)) {
 					notVisible = true;
 					retryable = true;
 					retryAfter = 30_000;
@@ -249,7 +254,7 @@ export function classifyAppendResult(
 		}
 		// JSON 解析失败时的原始文本兑底:CLI 某些报错不带 JSON
 		const rawText = String(err || "") + String(out || "");
-		if (!retryable && !notVisible && /not_visible|history is unavailable/i.test(rawText)) {
+		if (!retryable && !notVisible && NOT_VISIBLE_RE.test(rawText)) {
 			notVisible = true;
 			retryable = true;
 			retryAfter = 30_000;
@@ -280,7 +285,7 @@ export function buildAppendEnvelope(pending: DeltaRecord[]): string {
 
 /** 供给窗口期错误:服务端尚未可见,可后台重试。 */
 export function isTransientProvisioning(msg: string): boolean {
-	return /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i.test(msg);
+	return PROVISIONING_RE.test(msg);
 }
 
 /** 参照 delta-claude:实时活动带 _meta.delta 来源标记,否则外部 producer 的 agent 输出不会被渲染进 transcript。 */
@@ -311,7 +316,7 @@ function normPath(p: string): string {
 export type DeltaIdentity = {
 	threadId: string;
 	url: string;
-	visibility?: string;
+	visibility: "private" | "organization" | undefined;
 	externalId: string;
 	nextSequence: number;
 	worktrees: any[];
@@ -630,6 +635,30 @@ export default function ompDelta(pi: any) {
 	}
 
 	/** 已有线程:挂载 worktree + 启动 watch + 推送积压记录。 */
+	/** 从 omp 会话条目里取最新的绑定标记(appendEntry 写入;无则 null)。 */
+	function findSessionMarker(ctx: any): { threadId: string; worktreeRef?: string } | null {
+		try {
+			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
+			let marker: { threadId: string; worktreeRef?: string } | null = null;
+			for (const e of entries) {
+				if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) {
+					marker = e.data; // 取最后一个 = 最新绑定
+				}
+			}
+			return marker;
+		} catch {
+			return null; // 无会话读取能力时只能手动 /delta-share
+		}
+	}
+
+	/** 把对齐结果落进运行时:服务端游标为准,seqReady 放行 emit。 */
+	function applySequenceState(rc: { pending: DeltaRecord[]; seq: number; lastAcked: number }) {
+		rt.pending = rc.pending;
+		rt.seq = rc.seq;
+		rt.lastAcked = rc.lastAcked;
+		rt.seqReady = true;
+	}
+
 	async function attachAndStream(): Promise<void> {
 		rt.detaching = false;
 		const ref = String(rt.worktreeRef ?? "");
@@ -734,11 +763,7 @@ export default function ompDelta(pi: any) {
 		);
 		const id = resolveIdentityFromStatus(st);
 		rt.url = id?.url ?? null;
-		const rc = reconcileSequenceState(rt.pending, id?.nextSequence ?? 0);
-		rt.pending = rc.pending;
-		rt.seq = rc.seq;
-		rt.lastAcked = rc.lastAcked;
-		rt.seqReady = true;
+		applySequenceState(reconcileSequenceState(rt.pending, id?.nextSequence ?? 0));
 
 		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
 		if (!rt.titleSent) {
@@ -772,13 +797,11 @@ export default function ompDelta(pi: any) {
 
 		// 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
 		// 重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录。
+		// 只写读取方需要的字段:threadId + worktreeRef。
 		try {
 			pi?.appendEntry?.(MARKER_TYPE, {
 				threadId: rt.threadId,
 				worktreeRef: rt.worktreeRef,
-				visibility: rt.visibility,
-				cwd: rt.cwd,
-				sharedAt: new Date().toISOString(),
 			});
 		} catch {
 			/* 标记失败不影响本次连接;下次需手动 /delta-share */
@@ -841,18 +864,14 @@ export default function ompDelta(pi: any) {
 			}
 			rt.threadId = id.threadId;
 			rt.url = id.url || null;
-			rt.visibility = id.visibility as Runtime["visibility"];
+			rt.visibility = id.visibility ?? null;
 			const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
 			if (pick.ambiguous) {
 				notify("该线程挂了多个 worktree 身份,请 /delta-share 重新绑定。", "warning");
 				return;
 			}
 			rt.worktreeRef = pick.ref || String(marker.worktreeRef ?? "");
-			const rc = reconcileSequenceState(rt.pending, id.nextSequence);
-			rt.pending = rc.pending;
-			rt.seq = rc.seq;
-			rt.lastAcked = rc.lastAcked;
-			rt.seqReady = true;
+			applySequenceState(reconcileSequenceState(rt.pending, id.nextSequence));
 			await attachAndStream();
 			notify("Delta 已重连: " + (rt.url ?? rt.threadId));
 		} catch (e) {
@@ -967,16 +986,8 @@ export default function ompDelta(pi: any) {
 				}
 			} else if (!rt.threadId) {
 				// 进程重启后内存为空:凭会话标记重连(无标记则提示 /delta-share)
-				let marker: any = null;
-				try {
-					const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
-					for (const e of entries) {
-						if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) marker = e.data;
-					}
-				} catch {
-					/* 无会话读取能力 */
-				}
-				if (marker?.threadId) {
+				const marker = findSessionMarker(ctx);
+				if (marker) {
 					notify("凭会话标记重连 Delta 线程 " + marker.threadId + " …");
 					await reconnectByIdentity(marker);
 				} else {
@@ -997,16 +1008,8 @@ export default function ompDelta(pi: any) {
 		rt.cwd = String(ctx?.cwd ?? process.cwd());
 		// 绑定标记在 omp 会话记录里(appendEntry 写入,生命周期归 omp 管):
 		// 有标记 → 后台凭它重连;无标记 → 等用户显式 /delta-share。
-		let marker: any = null;
-		try {
-			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
-			for (const e of entries) {
-				if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) marker = e.data;
-			}
-		} catch {
-			/* 无会话读取能力时只能手动 /delta-share */
-		}
-		if (marker?.threadId) {
+		const marker = findSessionMarker(ctx);
+		if (marker) {
 			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连
 			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
 			void reconnectByIdentity(marker);
