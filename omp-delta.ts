@@ -790,20 +790,28 @@ export default function ompDelta(pi: any) {
 			],
 			{ cwd: rt.cwd },
 		);
-		// 身份与游标:thread create 幂等(source+external-id 相同即同一线程),
-		// status 提供 join url 与服务端游标;全部以服务端为权威,不落盘。
+		// 身份与游标:thread create 幂等(source+external-id 相同即同一线程)。
+		// status 在供给窗口期可能 not_visible:此时按全新线程处理(seq 从 0),
+		// 让首条记录先上服务端撑开 history 容器 —— 等容器打开后,后续连接的
+		// reconcile 会以服务端游标为准校正。不能让 status 失败阻断首条记录,
+		// 否则空容器永远等不到第一条记录(实测死锁 >90 分钟)。
 		rt.threadId = String(created?.thread_id ?? "");
 		rt.visibility = mode;
 		if (!rt.threadId) {
 			throw new Error("thread create 未返回 thread_id: " + JSON.stringify(created).slice(0, 300));
 		}
-		const st = await runDeltaJson(
-			["thread", "status", rt.threadId, "--source", SOURCE, "--external-id", rt.sid],
-			{ cwd: rt.cwd },
-		);
-		const id = resolveIdentityFromStatus(st);
-		rt.url = id?.url ?? null;
-	adoptServerCursor(id?.nextSequence ?? 0);
+		let id: DeltaIdentity | null = null;
+		try {
+			const st = await runDeltaJson(
+				["thread", "status", rt.threadId, "--source", SOURCE, "--external-id", rt.sid],
+				{ cwd: rt.cwd },
+			);
+			id = resolveIdentityFromStatus(st);
+		} catch {
+			/* 供给窗口期不可见:按空线程继续 */
+		}
+		if (id) rt.url = id.url ?? null;
+		adoptServerCursor(id?.nextSequence ?? 0);
 
 		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
 		if (!rt.titleSent) {
