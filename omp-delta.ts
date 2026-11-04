@@ -77,6 +77,7 @@ type Runtime = {
 	connectAttempts: number;
 	eventCtx: any; // session_start 的事件 ctx:持有托管 setTimeout
 	detaching: boolean;
+	detached: boolean; // 用户显式 detach(#18):指示清槽;重连成功才恢复(与断线 offline 区分)
 	mountChild: ChildProcess | null;
 	watchChild: ChildProcess | null;
 };
@@ -85,6 +86,7 @@ type Runtime = {
 
 let deltaBin: string | null = null;
 let envDumped = false;
+let statusSurfaceWarned = false; // #18:状态槽位缺失只提醒一次(模块变量跨会话共享 → 每进程一次)
 
 /** #11 诊断:delta 在 omp 内 spawn 时报 NotFound、外部终端同命令秒通。
  *  仅在 OMP_DELTA_DEBUG=1 时,首次 spawn 把解析到的二进制与关键 env 写进 omp 日志,定位环境差异。 */
@@ -518,6 +520,57 @@ export function liveActivity(update: Record<string, unknown>): Record<string, un
 	};
 }
 
+// ---- 同步状态指示(#18):状态→文案的纯接缝,单测覆盖;交互绘制在工厂闭包内 ----
+// 表面选型与生命周期研究见 docs/status-indicator-research.md(ctx.ui.setStatus 槽位)。
+
+export type SyncIndicatorState = "synced" | "supplying" | "offline" | "detached";
+
+/** deriveSyncIndicatorState 的输入:Runtime 里参与状态判定的字段快照。 */
+export type SyncIndicatorInput = {
+	connected: boolean;
+	paused: boolean;
+	detached: boolean; // 用户显式 detach(#18):指示清槽直到重连
+	expectingIdentity: boolean; // 重连在途:记录入临时队列等游标
+	threadId: string | null;
+	pendingCount: number; // 未确认记录(rt.pending.length)
+	retryAttempts: number; // 推送自动重试计数(>0 = 重试窗口)
+	historyWaitAttempts: number; // 供给窗口等待计数(>0 = 等待可见)
+	connectAttempts: number; // 后台重连计数(>0 = 重连窗口)
+};
+
+/** Runtime 字段 → 指示状态:detached(显式 detach 或从未绑定:清槽)/ offline(有绑定但断开且无在途重连,或暂停)/
+ *  supplying(已连接有在途工作,或断线但重连/供给在途:记录仍在排队)/ synced(空闲已连接)。
+ *  优先级:detached > paused > 在途重连(supplying:重连窗口期记录仍入队)> 断线 offline > supplying > synced。 */
+export function deriveSyncIndicatorState(input: SyncIndicatorInput): SyncIndicatorState {
+	if (input.detached || (!input.threadId && !input.connected)) return "detached";
+	if (input.paused) return "offline";
+	if (input.expectingIdentity || input.connectAttempts > 0) return "supplying";
+	if (!input.connected) return "offline";
+	if (input.pendingCount > 0 || input.retryAttempts > 0 || input.historyWaitAttempts > 0) {
+		return "supplying";
+	}
+	return "synced";
+}
+
+/** 线程短 id:thread_ 前缀是常量,先剥掉再截前 8 字符(否则只剩无信息量的 thread_0)。 */
+export function shortThreadId(threadId: string): string {
+	const bare = threadId.startsWith("thread_") ? threadId.slice("thread_".length) : threadId;
+	return bare.slice(0, 8);
+}
+
+const SYNC_STATE_LABELS: Record<Exclude<SyncIndicatorState, "detached">, string> = {
+	synced: "synced",
+	supplying: "supplying",
+	offline: "offline",
+};
+
+/** 状态 → 指示文案 `Δ <短id> · <状态>`;detached → null(调用方据此清槽)。
+ *  threadId 为 null 的防御路径渲染为空短 id(connected 时实际不可达:连接必先有 threadId)。 */
+export function renderStatusIndicator(state: SyncIndicatorState, threadId: string | null): string | null {
+	if (state === "detached") return null;
+	return "Δ " + shortThreadId(String(threadId ?? "")) + " · " + SYNC_STATE_LABELS[state];
+}
+
 /** 路径归一化比较(Windows/POSIX 分隔符与大小写)。 */
 function normPath(p: string): string {
 	return p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
@@ -729,6 +782,7 @@ export default function ompDelta(pi: any) {
 		connectAttempts: 0,
 		eventCtx: null,
 		detaching: false,
+		detached: false,
 		mountChild: null,
 		watchChild: null,
 	};
@@ -752,6 +806,61 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
+	// ---- 同步状态指示(#18):ctx.ui.setStatus 键槽(footer 状态带,研究见 docs/status-indicator-research.md) ----
+	// 键槽在 status-line 组件内持久(变更才失效渲染缓存,同文案上游还会再 dedup),
+	// 与 pi 自身 link-hint(omp:link-hints)共存;不与 Orca 标题栏 spinner 抢 title。
+	const STATUS_KEY = "omp-delta:sync";
+	let paintedStatus: string | null | undefined = undefined; // undefined = 从未绘制
+
+	/** 状态转移后重绘指示。每次绘制都走 spinner 同款守卫:ctx.ui 在
+	 *  session-replacing dialog 作废 runner 后可能抛错 —— 吞掉且不更新 paintedStatus,
+	 *  下一处转移自然重试;表面缺失则跳过绘制并只提醒一次(模块级去重)。 */
+	function paintStatus(ctx?: any): void {
+		const ui = (ctx ?? lastCtx ?? rt.eventCtx)?.ui;
+		const setStatus = ui?.setStatus;
+		if (typeof setStatus !== "function") {
+			if (!statusSurfaceWarned) {
+				statusSurfaceWarned = true;
+				notify("当前 omp 环境没有状态栏槽位(ctx.ui.setStatus),同步状态指示已停用。", "warning");
+			}
+			return;
+		}
+		const text = renderStatusIndicator(
+			deriveSyncIndicatorState({
+				connected: rt.connected,
+				paused: rt.paused,
+				detached: rt.detached,
+				expectingIdentity: rt.expectingIdentity,
+				threadId: rt.threadId,
+				pendingCount: rt.pending.length,
+				retryAttempts: rt.retryAttempts,
+				historyWaitAttempts: rt.historyWaitAttempts,
+				connectAttempts: rt.connectAttempts,
+			}),
+			rt.threadId,
+		);
+		if (text === paintedStatus) return; // 无变化不跨扩展边界
+		try {
+			setStatus.call(ui, STATUS_KEY, text ?? undefined);
+			paintedStatus = text; // spinner 纪律:绘制成功后才落状态,失败的绘制由下一转移重试
+		} catch {
+			/* runner 已作废:吞掉 */
+		}
+	}
+
+	/** 直接清槽(session_shutdown 用:2s 预算内的一次同步调用,不做状态推导)。 */
+	function clearStatus(): void {
+		const ui = (lastCtx ?? rt.eventCtx)?.ui;
+		const setStatus = ui?.setStatus;
+		if (typeof setStatus !== "function") return;
+		try {
+			setStatus.call(ui, STATUS_KEY, undefined);
+			paintedStatus = null;
+		} catch {
+			/* runner 已作废 */
+		}
+	}
+
 	function shouldRecord(): boolean {
 		// 重连在途(expectingIdentity)时也记录:进临时队列,游标到达后安全重编号;
 		// 没有任何绑定前景时才丢弃。
@@ -772,6 +881,7 @@ export default function ompDelta(pi: any) {
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
 		rt.pending.push(rec);
+		paintStatus(); // 入队:synced → supplying(空转窗口期也已由 expectingIdentity 覆盖)
 		void flush();
 		return seq;
 	}
@@ -794,7 +904,10 @@ export default function ompDelta(pi: any) {
 		try {
 			const pending = rt.pending.filter((r) => r.seq > rt.lastAcked);
 			if (pending.length === 0) {
-				rt.retryAttempts = 0;
+				if (rt.retryAttempts !== 0) {
+					rt.retryAttempts = 0;
+					paintStatus(); // 重试窗口结束
+				}
 				return;
 			}
 
@@ -834,6 +947,7 @@ export default function ompDelta(pi: any) {
 				} catch {
 					/* 无进行中 turn */
 				}
+				paintStatus();
 				return;
 			}
 
@@ -853,6 +967,7 @@ export default function ompDelta(pi: any) {
 						"Delta 线程供给中,等待可见("
 						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + cls.errMsg,
 					);
+					paintStatus();
 					schedule(() => {
 						void flush();
 					}, cls.retryAfter);
@@ -862,12 +977,14 @@ export default function ompDelta(pi: any) {
 						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + cls.errMsg + ")",
 						"warning",
 					);
+					paintStatus();
 					schedule(() => {
 						void flush();
 					}, cls.retryAfter);
 				} else {
 					rt.paused = true;
 					notify("Delta 推送失败,已暂停自动重试:" + cls.errMsg + "(用 /delta-retry 恢复)", "warning");
+					paintStatus();
 				}
 			}
 			if (r.code === 0 && rt.lastAcked < rt.seq) {
@@ -879,9 +996,10 @@ export default function ompDelta(pi: any) {
 					}, 1_000);
 				} else {
 					rt.paused = true;
-				notify("Delta 仍有未同步记录,自动重试已达上限(用 /delta-retry 恢复)", "warning");
+					notify("Delta 仍有未同步记录,自动重试已达上限(用 /delta-retry 恢复)", "warning");
 				}
 			}
+			paintStatus(); // 覆盖上面所有分支:确认进展(清队列)/ 重试窗口 / 供给等待 / 暂停
 		} catch (e) {
 			log("flush 异常: " + String(e));
 		} finally {
@@ -1032,6 +1150,7 @@ export default function ompDelta(pi: any) {
 
 	async function attachAndStream(): Promise<void> {
 		rt.detaching = false;
+		rt.detached = false; // 重新附着:清除显式 detach 标记,指示恢复展示
 		const ref = String(rt.worktreeRef ?? "");
 		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
 		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
@@ -1079,6 +1198,7 @@ export default function ompDelta(pi: any) {
 		rt.connectAttempts = 0;
 		startWatch();
 		void flush();
+		paintStatus(); // connect:supplying/synced 起点确认/清除 offline
 	}
 
 	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
@@ -1206,22 +1326,26 @@ export default function ompDelta(pi: any) {
 				rt.connectAttempts += 1;
 				if (rt.connectAttempts % 5 === 0)
 					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+				paintStatus();
 				schedule(() => {
 					void retryConnect(mode, org);
 				}, 30_000);
 				return;
 			}
 			notify("Delta 重连失败:" + msg, "warning");
+			paintStatus(); // 重连链终结:decisive 失败时 expectingIdentity 已被内层关闭 → offline/detached
 		}
 	}
 
 	function detach(quiet = false) {
 		rt.detaching = true;
+		rt.detached = true;
 		killChild(rt.mountChild);
 		rt.mountChild = null;
 		killChild(rt.watchChild);
 		rt.watchChild = null;
 		rt.connected = false;
+		paintStatus(); // detach → detached → 清槽(setStatus key → undefined,释放槽位)
 		if (!quiet) notify("已断开 Delta 同步(线程与已上传内容保留)。");
 	}
 
@@ -1300,6 +1424,7 @@ export default function ompDelta(pi: any) {
 			if (pick.ambiguous) {
 				notify("该线程挂了多个 worktree 身份,请 /delta-share 重新绑定。", "warning");
 				rt.expectingIdentity = false;
+				paintStatus();
 				return;
 			}
 			let ref = pick.ref;
@@ -1309,11 +1434,12 @@ export default function ompDelta(pi: any) {
 					notify(
 						"该 Delta 线程绑定的是 " + marker.cwd + " 的 checkout,当前目录是 " + rt.cwd
 							+ ";请在原目录打开 omp,或重新 /delta-share(旧线程保留在 Delta)。",
-							"warning",
-						);
-						rt.expectingIdentity = false;
-						return;
-					}
+						"warning",
+					);
+					rt.expectingIdentity = false;
+					paintStatus(); // decisive 失败:supplying → offline(线程在,连接断)
+					return;
+				}
 				ref = String(marker.worktreeRef ?? "");
 			}
 			rt.worktreeRef = ref;
@@ -1323,6 +1449,7 @@ export default function ompDelta(pi: any) {
 		} catch (e) {
 			// 暂时性错误(含供给窗口):expectingIdentity 保留,记录继续排队;/delta-retry 可再试
 			notify("Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)", "warning");
+			paintStatus(); // 大概率仍是 supplying(expectingIdentity 保留);decisive 失败已在内层清掉并重绘
 		}
 	}
 
@@ -1391,12 +1518,14 @@ export default function ompDelta(pi: any) {
 					rt.connectAttempts += 1;
 					if (rt.connectAttempts === 1 || rt.connectAttempts % 5 === 0)
 						notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+					paintStatus(); // 后台重连窗口 → supplying
 					schedule(() => {
 						void retryConnect(mode, org);
 					}, 30_000);
 					return;
 				}
 				notify("连接失败:" + msg, "warning");
+				paintStatus(); // decisive 失败:回到 detached/offline
 			}
 		},
 	});
@@ -1472,6 +1601,7 @@ export default function ompDelta(pi: any) {
 			rt.retryAttempts = 0;
 			rt.historyWaitAttempts = 0; // 供给窗口可能超过旧预算:手动重试必须重新武装长预算
 			rt.connectAttempts = 0;
+			paintStatus(ctx); // 手动重试清除 offline/paused
 			if (rt.threadId && !rt.connected) {
 				notify("尝试重连 Delta 线程 " + rt.threadId + " …");
 				try {
@@ -1479,6 +1609,7 @@ export default function ompDelta(pi: any) {
 					notify("已重连。");
 				} catch (e) {
 					notify("重连失败:" + String(e instanceof Error ? e.message : e), "warning");
+					paintStatus(); // 重连失败:线程仍在 → offline
 					return;
 				}
 			} else if (!rt.threadId) {
@@ -1565,6 +1696,7 @@ export default function ompDelta(pi: any) {
 		rt.eventCtx = ctx; // 托管定时器来源
 		rt.isSub = (ctx?.agent?.kind ?? "main") !== "main";
 		if (rt.isSub) return;
+		rt.detached = false; // 新会话:显式 detach 语义不延续(绑定标记另行发现)
 		rt.sid = String(ctx?.sessionManager?.getSessionId?.() ?? "sess-" + randomUUID());
 		rt.cwd = String(ctx?.cwd ?? process.cwd());
 		// 绑定标记在 omp 会话记录里(appendEntry 写入,生命周期归 omp 管):
@@ -1575,11 +1707,13 @@ export default function ompDelta(pi: any) {
 			// 等待期间事件照常入临时队列(expectingIdentity),游标到达后重编号补发
 			rt.expectingIdentity = true;
 			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
+			paintStatus(ctx); // session_start:重建/校准槽位(session-replacing 边界,spinner 同款)
 			void reconnectByIdentity(marker);
 		} else {
 			// 无 marker(moveOff/fork/首次):从服务端按 checkout 发现绑定;
 			// 发现不了才是真正的首次,等用户显式 /delta-share。
 			rt.expectingIdentity = true;
+			paintStatus(ctx);
 			void (async () => {
 				try {
 					const found = await discoverBindingByCheckout();
@@ -1588,9 +1722,11 @@ export default function ompDelta(pi: any) {
 						await reconnectByIdentity(found);
 					} else {
 						rt.expectingIdentity = false;
+						paintStatus(); // 发现不了绑定:回到 detached,清槽
 					}
 				} catch (e) {
 					rt.expectingIdentity = false;
+					paintStatus();
 					notify("Delta 绑定发现失败:" + String(e instanceof Error ? e.message : e) + "(/delta-share 可手动连接)", "warning");
 				}
 			})();
@@ -1602,6 +1738,8 @@ export default function ompDelta(pi: any) {
 		if (rt.connected || rt.mountChild || rt.watchChild) {
 			detach(true);
 			notify("会话已切换,Delta 同步已停止;新会话可用 /delta-share 重新连接。");
+		} else {
+			paintStatus(); // 重连在途中切换:无子进程可拆,但仍校准指示(no-op 时上游 dedup)
 		}
 	});
 
@@ -1698,5 +1836,6 @@ export default function ompDelta(pi: any) {
 		}
 		rt.mountChild = null;
 		rt.watchChild = null;
+		clearStatus(); // 释放状态槽位(单次同步 setStatus;研究§6:#18 会话拆卸约束)
 	});
 }
