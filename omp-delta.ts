@@ -46,7 +46,7 @@ export const PLUGIN_REINSTALL_CMD = "omp plugin install 'github:Samuka007/omp-de
 const NOT_VISIBLE_RE = /not_visible|history is unavailable/i;
 const PROVISIONING_RE = /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i;
 
-type DeltaRecord = {
+export type DeltaRecord = {
 	seq: number;
 	turnSequence?: number;
 	update: Record<string, unknown>;
@@ -974,14 +974,17 @@ export function isTransientProvisioning(msg: string): boolean {
 	return PROVISIONING_RE.test(msg);
 }
 
-/** Following delta-claude: live activity carries a _meta.delta source marker, otherwise an external producer's agent output is not rendered into the transcript. */
+/** Following delta-claude: live activity carries a _meta.delta source marker, otherwise an external producer's agent output is not rendered into the transcript.
+ *  A tool_call_update whose content carries a structured diff renders through the edit kind (history backfill #30; live edit cards are OD-8). */
 export function liveActivity(update: Record<string, unknown>): Record<string, unknown> {
 	const kind = update.sessionUpdate;
 	const activityKind =
 		kind === "user_message" || kind === "agent_message" || kind === "agent_thought"
 			? String(kind)
 			: kind === "tool_call_update"
-				? "tool_call"
+				? Array.isArray(update.content) && update.content.some((item) => isJsonObject(item) && (item as any).type === "diff")
+					? "edit"
+					: "tool_call"
 				: undefined;
 	if (!activityKind) return update;
 	return {
@@ -990,6 +993,180 @@ export function liveActivity(update: Record<string, unknown>): Record<string, un
 			delta: { work_origin: "external_agent", interaction_surface: "cli", activity_kind: activityKind },
 		},
 	};
+}
+
+// ---- OD-5: history backfill on share (initial export, #29 text / #30 tool calls / #31 turn structure) ----
+// Reference: delta-claude's share.ts snapshot + content.ts messageUpdates. The snapshot is read from
+// omp's normalized, post-compaction display transcript (sessionManager.buildSessionContext with
+// transcript + collapseCompactedHistory) and converted into DeltaRecords with turn grouping, so joiners
+// see the full history instead of only what happens after sharing.
+
+export type ExportUpdate = Record<string, unknown> & { sessionUpdate: string };
+
+/** Empty-thread guard (#29): export only onto a fresh producer. next_sequence 1 (or unknown — the
+ *  provisioning window hides status) means the thread carries no records; anything above 1 is an
+ *  existing thread (re-share) and must not duplicate anything. */
+export function shouldExportHistory(serverNextSequence: number | null | undefined): boolean {
+	return serverNextSequence === null || serverNextSequence === undefined || serverNextSequence <= 1;
+}
+
+function isTextBlock(b: any): boolean {
+	return b != null && typeof b === "object" && b.type === "text" && typeof b.text === "string";
+}
+
+/** Joins the text blocks of omp message content (string or block array); non-text blocks are skipped. */
+function textOfContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(isTextBlock)
+		.map((b) => (b as { text: string }).text)
+		.join("\n\n");
+}
+
+function blocksOf(content: unknown): any[] {
+	if (typeof content === "string") return [{ type: "text", text: content }];
+	return Array.isArray(content) ? content : [];
+}
+
+/** Coarse ACP-style kind for a tool name, mirroring delta-claude's toolInfo kind vocabulary. */
+function exportToolKind(name: string): string {
+	const n = name.toLowerCase();
+	if (/edit|patch|write/.test(n)) return "edit";
+	if (/read|view/.test(n)) return "read";
+	if (/grep|glob|find|search|ls/.test(n)) return "search";
+	if (/bash|exec|command|terminal/.test(n)) return "execute";
+	if (/fetch|web/.test(n)) return "fetch";
+	if (/task|agent|plan|think/.test(n)) return "think";
+	return "other";
+}
+
+/** Short human title for an exported tool call, taken from its first useful argument. */
+function exportToolTitle(name: string, input: unknown): string {
+	const v = input != null && typeof input === "object" ? (input as Record<string, unknown>) : {};
+	for (const key of ["description", "command", "file_path", "path", "url", "pattern", "query", "prompt", "symbol", "input"]) {
+		const field = v[key];
+		if (typeof field === "string" && field.trim()) {
+			const line = field.split("\n")[0]!.trim();
+			return (name + " " + line).replace(/\s+/g, " ").slice(0, 120);
+		}
+	}
+	return name.slice(0, 120);
+}
+
+/** A structured edit result becomes a diff content item (delta-claude's editDiff shape); omp edit tools
+ *  carry the unified diff in result.details.diff and the file path in result.details.path. */
+export function exportResultDiff(details: unknown): Record<string, unknown>[] {
+	const d = details != null && typeof details === "object" ? (details as Record<string, unknown>) : {};
+	const text = typeof d.diff === "string" ? d.diff : "";
+	if (!text.trim()) return [];
+	const path = typeof d.path === "string" ? d.path : "unknown";
+	const operation = d.oldText === undefined ? "add" : "modify";
+	return [{ type: "diff", changes: [{ operation, path }], patch: { format: "git_patch", text } }];
+}
+
+/** Converts one transcript message into Delta sessionUpdate records (delta-claude's messageUpdates,
+ *  adapted to omp's message shapes). toolResult messages export their completed update directly —
+ *  pairing with the call happens by toolCallId in transcript order; unpaired halves are tolerated (#30). */
+export function exportMessageUpdates(message: any, id: string): ExportUpdate[] {
+	const role = message?.role;
+	if (role === "user") {
+		if (message.synthetic || message.steering) return []; // system-injected context, not conversation
+		const text = textOfContent(message.content).trim();
+		if (!text) return [];
+		return [{ sessionUpdate: "user_message", messageId: id, content: [{ type: "text", text }] }];
+	}
+	if (role === "toolResult" && typeof message.toolCallId === "string") {
+		const diff = message.isError ? [] : exportResultDiff(message.details);
+		const output = textOfContent(message.content);
+		const update: ExportUpdate = {
+			sessionUpdate: "tool_call_update",
+			toolCallId: message.toolCallId,
+			status: message.isError ? "failed" : "completed",
+			rawOutput: diff.length ? null : (message.details ?? (output || null)),
+		};
+		if (diff.length) {
+			update.content = diff;
+		} else if (output) {
+			update.content = [{ type: "content", content: { type: "text", text: output } }];
+		}
+		return [update];
+	}
+	if (role !== "assistant") return [];
+	const updates: ExportUpdate[] = [];
+	let content: Record<string, unknown>[] = [];
+	let first = 0;
+	const flush = () => {
+		if (!content.length) return;
+		updates.push({ sessionUpdate: "agent_message", messageId: id + ":message:" + first, content });
+		content = [];
+	};
+	for (const block of blocksOf(message.content)) {
+		if (isTextBlock(block)) {
+			if (!String(block.text).trim()) continue;
+			if (!content.length) first = updates.length;
+			content.push({ type: "text", text: block.text });
+		} else if (block != null && typeof block === "object" && block.type === "toolCall" && typeof block.id === "string") {
+			flush();
+			const name = String(block.name ?? "tool");
+			updates.push({
+				sessionUpdate: "tool_call_update",
+				toolCallId: block.id,
+				name,
+				title: exportToolTitle(name, block.arguments),
+				kind: exportToolKind(name),
+				status: "in_progress", // the transcript result row (if any) closes the call
+				rawInput: block.arguments != null && typeof block.arguments === "object" ? block.arguments : {},
+			});
+		}
+		// thinking blocks are OD-6's scope, not the backfill's
+	}
+	flush();
+	return updates;
+}
+
+/** Builds the complete initial-export plan (#29/#30/#31): each non-synthetic user prompt opens a turn
+ *  (running record whose turnSequence equals its own sequence — the contract's render gate), the turn's
+ *  messages reference that turnSequence, and an idle record closes it. Sequences are contiguous from
+ *  startSeq and never reused. A state update never goes out without its turnSequence. */
+export function buildInitialExportRecords(messages: readonly any[], startSeq: number): DeltaRecord[] {
+	const updatesByMessage = messages.map((m, i) => exportMessageUpdates(m, "h" + i));
+	const opensTurn = (i: number) => {
+		const m: any = messages[i];
+		return m?.role === "user" && !m.synthetic && !m.steering && updatesByMessage[i]!.length > 0;
+	};
+	// Turn ranges: an opening prompt runs through every following message until the next opening prompt
+	// (or the end of the transcript), so the turn's idle closes after its last message.
+	const starts: number[] = [];
+	for (let i = 0; i < messages.length; i++) if (opensTurn(i)) starts.push(i);
+	const records: DeltaRecord[] = [];
+	let seq = startSeq - 1;
+	const emitRange = (from: number, to: number, turnSeq: number) => {
+		records.push({ seq: turnSeq, turnSequence: turnSeq, update: { sessionUpdate: "state_update", state: "running" } });
+		for (let i = from; i < to; i++) {
+			for (const update of updatesByMessage[i]!) {
+				seq += 1;
+				records.push({ seq, turnSequence: turnSeq, update: liveActivity(update) });
+			}
+		}
+		seq += 1;
+		records.push({ seq, turnSequence: turnSeq, update: { sessionUpdate: "state_update", state: "idle" } });
+	};
+	// Leading content with no opening prompt (a share taken mid-turn) still forms its own implicit turn.
+	if (starts.length === 0 || starts[0]! > 0) {
+		const head = starts.length === 0 ? messages.length : starts[0]!;
+		if (updatesByMessage.slice(0, head).some((u) => u.length > 0)) {
+			seq += 1;
+			emitRange(0, head, seq);
+		}
+	}
+	for (let t = 0; t < starts.length; t++) {
+		const from = starts[t]!;
+		const to = t + 1 < starts.length ? starts[t + 1]! : messages.length;
+		seq += 1;
+		emitRange(from, to, seq);
+	}
+	return records;
 }
 
 // ---- Sync status indicator (#18): pure status→label seam, unit-tested; interactive painting lives in the factory closure ----
@@ -1630,6 +1807,20 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
+	/** Reads the session's normalized, post-compaction main conversation (omp's display transcript:
+	 *  resolved branch view, compactions collapsed). Empty when session access is unavailable —
+	 *  the share then connects without history, exactly as before this feature. */
+	function readTranscriptMessages(): any[] {
+		try {
+			const sm = rt.eventCtx?.sessionManager ?? lastCtx?.sessionManager;
+			const ctx = sm?.buildSessionContext?.({ transcript: true, collapseCompactedHistory: true });
+			return Array.isArray(ctx?.messages) ? (ctx.messages as any[]) : [];
+		} catch (e) {
+			log("history snapshot failed, sharing without backfill: " + String(e instanceof Error ? e.message : e));
+			return [];
+		}
+	}
+
 	/** Landing the alignment result into the runtime: the server cursor is authoritative; seqReady gates flush/emit. */
 	function applySequenceState(rc: { pending: DeltaRecord[]; seq: number; lastAcked: number }) {
 		rt.pending = rc.pending;
@@ -1855,6 +2046,22 @@ export default function ompDelta(pi: any) {
 		}
 		if (id) rt.url = id.url ?? null;
 		adoptServerCursor(id?.nextSequence ?? 0);
+
+		// OD-5 (#29/#30/#31): history backfill — export the normalized, post-compaction main conversation
+		// onto a fresh thread before anything live. buildSessionContext is synchronous, so the snapshot
+		// cannot interleave with live events: turns made "during" the export enter the normal queue and
+		// are appended after the exported records (delivery preserves sequence order). The empty-thread
+		// guard keeps a re-share onto a thread that already has records from duplicating anything.
+		if (shouldExportHistory(id?.nextSequence ?? null)) {
+			const messages = readTranscriptMessages();
+			const records = buildInitialExportRecords(messages, rt.seq + 1);
+			if (records.length) {
+				rt.pending.push(...records);
+				rt.seq = records[records.length - 1]!.seq;
+				notify("Exporting " + messages.length + " earlier messages (" + records.length + " records) to Delta…");
+				paintStatus();
+			}
+		}
 
 		// Push the first record immediately: an empty thread never reaches the server, and attach/status would invalid_reference
 		if (!rt.titleSent) {
