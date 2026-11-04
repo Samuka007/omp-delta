@@ -6,7 +6,7 @@ A community implementation of the [officially documented plugin contract](https:
 
 ## What it does
 
-- `/delta-share` — connect the current omp session to a Delta thread: create thread (idempotent) → attach + mount the worktree (including uncommitted changes) → share with your organization (confirmation first)
+- `/delta-share` — connect the current omp session to a Delta thread: create thread (idempotent) → attach + mount the worktree (including uncommitted changes) → share privately or with your organization (interactive visibility picker when run without arguments; `/delta-share private` to skip it — confirmation first either way)
 - Records automatically from then on: user input, turn start/stop, assistant replies, tool calls — watchable live in the Delta app or browser
 - Teammate comments in Delta flow back into omp context as follow-ups (never auto-trigger a turn)
 - Someone takes over the thread → the local turn stops (`superseded` / `fenced`)

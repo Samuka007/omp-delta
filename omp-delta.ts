@@ -256,6 +256,54 @@ async function resolveOrg(): Promise<{ id: string; name: string }> {
 	return org;
 }
 
+// ---- /delta-share 可见性决策(纯接缝:ui 由调用方注入,测试可传 fake ctx.ui.select) ----
+
+/** pickShareVisibility 的结果:mode null = 用户放弃选择器(取消连接);fallback 非空 = 非交互回落默认(文案交调用方 notify)。 */
+export type VisibilityPick = {
+	mode: "private" | "organization" | null;
+	fallback: string | null;
+};
+
+/** /delta-share 可见性决策(#16):
+ *  - 显式参数(priv* 前缀 = 私有,其余非空参数 = 组织)→ 直接采用,绝不触碰选择器(向后兼容);
+ *  - 无参数 → ctx.ui.select 弹出 Private / Organization(带当前组织名)选择器,先于 consent confirm;
+ *  - 非交互(select 缺失/抛错)→ 回落默认 organization 并带回 fallback 文案,绝不抛出;
+ *  - 用户放弃选择器(Esc/undefined)→ mode null,调用方按取消处理。 */
+export async function pickShareVisibility(
+	args: string | null | undefined,
+	ui: any,
+	org: { id: string; name: string },
+): Promise<VisibilityPick> {
+	const arg = String(args ?? "").trim().toLowerCase();
+	if (arg) {
+		// 旧行为:priv 前缀 → 私有,其余显式参数 → 组织
+		return { mode: arg.startsWith("priv") ? "private" : "organization", fallback: null };
+	}
+	const options = [
+		{ label: "Private(私有线程,仅自己可见)", description: "不共享给组织" },
+		{ label: "Organization(共享给 " + org.name + ")", description: "组织成员可见" },
+	];
+	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>,返回所选 label
+	if (typeof select !== "function") {
+		return { mode: "organization", fallback: "当前环境不支持交互选择,使用默认可见性:共享给组织 " + org.name };
+	}
+	let label: unknown;
+	try {
+		label = await select("选择 Delta 线程可见性", options);
+	} catch (e) {
+		return {
+			mode: "organization",
+			fallback: "可见性选择器不可用(" + String(e instanceof Error ? e.message : e) + "),使用默认:共享给组织 " + org.name,
+		};
+	}
+	if (typeof label !== "string") {
+		return { mode: null, fallback: null }; // 用户放弃(Esc)
+	}
+	if (label === options[0].label) return { mode: "private", fallback: null };
+	// 第二项 / 无法识别的标签都归组织(与旧默认一致;confirm 会再次展示组织名供最终确认)
+	return { mode: "organization", fallback: null };
+}
+
 // ---- 纯函数接缝(可直接单测;合约语义见 docs/contract-notes.md) ----
 
 /** 未登录判定:对 delta 的 stdout+stderr 原文做签名匹配(不区分 JSON/纯文本)。 */
@@ -1138,7 +1186,7 @@ export default function ompDelta(pi: any) {
 	// ---- 事件与命令注册 ----
 
 	pi.registerCommand("delta-share", {
-		description: "把当前 omp 会话连接到 Delta 线程(/delta-share private 为私有,默认共享给组织)",
+		description: "把当前 omp 会话连接到 Delta 线程(无参数:交互选择可见性;private 参数:直接私有;非交互环境默认共享给组织)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd); // omp 的 /cd 会改会话 cwd,连接前以当前值为准
@@ -1150,14 +1198,20 @@ export default function ompDelta(pi: any) {
 				notify("已连接:" + rt.threadId);
 				return;
 			}
-			const mode: "private" | "organization" = String(args ?? "").trim().toLowerCase().startsWith("priv")
-				? "private"
-				: "organization";
 			// 合约要求：共享前必须征得用户同意，并告知可见范围（组织名+内容）
 			let ok = true;
 			let org: { id: string; name: string };
+			let mode: "private" | "organization" = "organization"; // 兜底默认;显式参数或选择器会覆盖
 			try {
 				org = await resolveOrg();
+				// 可见性(#16):显式参数直达旧行为;无参数先弹选择器(私有 vs 组织),再走同一个确认+连接路径
+				const pick = await pickShareVisibility(args, ctx?.ui, org);
+				if (pick.mode === null) {
+					notify("已取消,未创建 Delta 线程。");
+					return;
+				}
+				if (pick.fallback) notify(pick.fallback, "warning");
+				mode = pick.mode;
 				if (typeof ctx?.ui?.confirm === "function") {
 					ok = await ctx.ui.confirm(
 						mode === "private" ? "连接 Delta（私有线程）？" : "连接 Delta 并把会话共享给组织？",
