@@ -10,7 +10,7 @@
  * MVP 范围:
  *   - 只记录主会话(ctx.agent.kind === "main");子代理 → Delta 子线程留待下一步
  *   - 首次连接从当下开始记录,不回导历史会话
- *   - 命令:/delta-share /delta-status /delta-detach /delta-retry /delta-org(只读) /delta-update
+ *   - 命令:/delta(路由)与平铺别名 /delta-share /delta-status /delta-detach /delta-retry /delta-org(只读) /delta-update
  *
  * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
  * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
@@ -309,6 +309,50 @@ export async function pickShareVisibility(
 }
 
 // ---- 纯函数接缝(可直接单测;合约语义见 docs/contract-notes.md) ----
+
+// ---- /delta 路由(#15):单一入口;平铺命令保持原样作为别名 ----
+
+/** /delta 路由决策:menu = 无参数(用法菜单,不是错误);route = 已实现子命令(转发同一 handler);
+ *  unimplemented = 已知但未实现(join,#17);unknown = 未知子命令。 */
+export type DeltaRouteDecision =
+	| { kind: "menu" }
+	| { kind: "route"; command: "delta-share" | "delta-status" | "delta-detach" | "delta-retry"; args: string }
+	| { kind: "unimplemented"; command: "join" }
+	| { kind: "unknown"; command: string };
+
+/** 解析 `/delta <子命令> [剩余参数]`(#15):大小写不敏感,空白折叠。
+ *  子命令与平铺命令一一对应:share→delta-share、status→delta-status、detach→delta-detach、
+ *  retry→delta-retry;join 尚未实现(#17)。/delta-org、/delta-update 不在路由内(有独立拼写,菜单里指引)。 */
+export function parseDeltaRouter(args: string): DeltaRouteDecision {
+	const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+	if (parts.length === 0) return { kind: "menu" };
+	const sub = parts[0].toLowerCase();
+	const rest = parts.slice(1).join(" ");
+	if (sub === "join") return { kind: "unimplemented", command: "join" };
+	const route: Record<string, "delta-share" | "delta-status" | "delta-detach" | "delta-retry"> = {
+		share: "delta-share",
+		status: "delta-status",
+		detach: "delta-detach",
+		retry: "delta-retry",
+	};
+	const command = route[sub];
+	if (!command) return { kind: "unknown", command: sub };
+	return { kind: "route", command, args: rest };
+}
+
+/** /delta 无参数时的用法菜单(不是错误)。 */
+export function renderDeltaMenu(): string {
+	return [
+		"delta — omp-delta 命令路由:",
+		"  /delta share [private]   连接当前会话(= /delta-share)",
+		"  /delta status            查看连接与同步状态(= /delta-status)",
+		"  /delta retry             恢复/重试推送(= /delta-retry)",
+		"  /delta detach            断开同步(= /delta-detach)",
+		"  /delta join <link|id>    加入已有线程(尚未实现:#17)",
+		"  其他命令:/delta-org list|current · /delta-update [check]",
+		"  平铺别名继续可用:/delta-share /delta-status /delta-detach /delta-retry",
+	].join("\n");
+}
 
 /** 未登录判定:对 delta 的 stdout+stderr 原文做签名匹配(不区分 JSON/纯文本)。 */
 export function isUnauthenticatedText(text: string): boolean {
@@ -1284,7 +1328,17 @@ export default function ompDelta(pi: any) {
 
 	// ---- 事件与命令注册 ----
 
-	pi.registerCommand("delta-share", {
+	// #15:可路由平铺命令的 handler 引用,注册时回填;/delta 路由复用同一函数对象(别名语义由构造保证)
+	const deltaHandlers: Record<string, (args: string, ctx: any) => Promise<void>> = {};
+	const registerDeltaCommand = (
+		name: string,
+		def: { description: string; handler: (args: string, ctx: any) => Promise<void> },
+	) => {
+		deltaHandlers[name] = def.handler;
+		pi.registerCommand(name, def);
+	};
+
+	registerDeltaCommand("delta-share", {
 		description: "把当前 omp 会话连接到 Delta 线程(无参数:交互选择可见性;private 参数:直接私有;非交互环境默认共享给组织)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
@@ -1347,7 +1401,7 @@ export default function ompDelta(pi: any) {
 		},
 	});
 
-	pi.registerCommand("delta-status", {
+	registerDeltaCommand("delta-status", {
 		description: "查看 omp-delta 连接与同步状态",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
@@ -1365,7 +1419,7 @@ export default function ompDelta(pi: any) {
 		},
 	});
 
-	pi.registerCommand("delta-detach", {
+	registerDeltaCommand("delta-detach", {
 		description: "断开 Delta 同步(保留线程与已上传内容)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
@@ -1409,7 +1463,7 @@ export default function ompDelta(pi: any) {
 		},
 	});
 
-	pi.registerCommand("delta-retry", {
+	registerDeltaCommand("delta-retry", {
 		description: "恢复/重试 Delta 推送(断线后也可重连)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
@@ -1475,6 +1529,34 @@ export default function ompDelta(pi: any) {
 				}),
 				ok && parsed ? "info" : "warning",
 			);
+		},
+	});
+
+	// /delta 路由(#15):转发到平铺命令的同一 handler;无参数输出用法菜单而非报错
+	pi.registerCommand("delta", {
+		description: "omp-delta 命令路由:/delta share|status|retry|detach(无参数显示用法;平铺命令仍可用)",
+		handler: async (args: string, ctx: any) => {
+			lastCtx = ctx;
+			const d = parseDeltaRouter(args);
+			if (d.kind === "menu") {
+				notify(renderDeltaMenu());
+				return;
+			}
+			if (d.kind === "unimplemented") {
+				notify("/delta join 尚未实现(#17):weak join 落地前,请先在 Delta 侧复制 join 链接并等待该能力上线。", "warning");
+				return;
+			}
+			if (d.kind === "unknown") {
+				notify("未知子命令:" + d.command + "\n\n" + renderDeltaMenu(), "warning");
+				return;
+			}
+			const handler = deltaHandlers[d.command];
+			if (!handler) {
+				// 注册顺序保证到这里必然已回填;防御性兑底
+				notify("内部错误:子命令 " + d.command + " 未注册。", "warning");
+				return;
+			}
+			await handler(d.args, ctx);
 		},
 	});
 

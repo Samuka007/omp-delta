@@ -13,6 +13,7 @@ A community implementation of the [officially documented plugin contract](https:
 - Zero local state: thread identity lives in the omp session record + DeltaDB, the delivery cursor is the server's `next_sequence`; undelivered records queue in memory and retryable failures back off automatically
 - `/delta-status`, `/delta-detach`, `/delta-retry` for connection management; `/delta-org list|current` for read-only org inspection (no switching)
 - `/delta-update [check]` checks (`check`) or installs Delta updates — output always carries a reinstall hint for this plugin, since omp has no marketplace auto-update
+- `/delta share|status|retry|detach` routes to the same flows with a usage menu on no arguments; the flat `/delta-*` commands keep working unchanged as aliases (`join` is not implemented yet, #17)
 
 ## Install
 
