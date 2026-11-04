@@ -1,6 +1,6 @@
 {
 	"name": "omp-delta",
-	        "version": "0.2.0",
+	"version": "0.0.3",
 	"description": "Record a live oh-my-pi (omp) session into a Delta thread via the Delta CLI — /delta-share, live watch, comment reflux",
 	"type": "module",
 	"files": ["package.json", "omp-delta.ts", "README.md", "docs"],
