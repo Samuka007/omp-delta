@@ -16,8 +16,14 @@ A community implementation of the [officially documented plugin contract](https:
 ## Install
 
 ```sh
-cp omp-delta.ts ~/.omp/agent/extensions/omp-delta.ts
+omp plugin install 'github:Samuka007/omp-delta'
 # restart omp, then run /delta-share inside a git repository
+```
+
+For local development (symlink, edits stay live):
+
+```sh
+omp plugin link ./omp-delta
 ```
 
 Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp running inside a git repository **with a remote**.
