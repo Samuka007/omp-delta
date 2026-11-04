@@ -354,7 +354,7 @@ export function renderDeltaMenu(): string {
 	return [
 		"delta — omp-delta 命令路由:",
 		"  /delta share [private]   连接当前会话(= /delta-share)",
-		"  /delta join <link|id>    加入已有线程并挂载当前 checkout(= /delta-join)",
+		"  /delta join <link|id>    加入已有线程;--move 物化 checkout 并指引 /move(= /delta-join)",
 		"  /delta status            查看连接与同步状态(= /delta-status)",
 		"  /delta retry             恢复/重试推送(= /delta-retry)",
 		"  /delta detach            断开同步(= /delta-detach)",
@@ -363,8 +363,8 @@ export function renderDeltaMenu(): string {
 	].join("\n");
 }
 
-// ---- /delta-join(#17):弱加入 —— 不搬家、不物化 checkout,把当前 checkout 挂上已有线程 ----
-// #22(完整 join:checkout 物化 + /move 指引)是有意留出的后续:这里的接缝只认目标,不动目录。
+// ---- /delta-join(#17,#22):把当前会话挂上已有线程;默认 weak(挂当前 checkout),
+// ---- --move/--into 物化线程 checkout 到新目录并指引手动 /move(自动化待上游 oh-my-pi#17441)。
 
 export type JoinTarget =
 	| { kind: "link"; shareId: string; raw: string }
@@ -400,6 +400,82 @@ export type JoinFailureKind = "unauthenticated" | "account-mismatch" | "unknown"
 /** parseJoinTarget 中可直接交给 CLI 解析的三种形态(link/share-id/thread-id);
  *  empty/invalid 在本地拦截,永不进入 joinShared。 */
 export type ResolvableJoinTarget = Extract<JoinTarget, { kind: "link" | "share-id" | "thread-id" }>;
+
+/** /delta-join 调用参数(#22):目标 + 物化选项。--into 隐含 --move;
+ *  into === "" 表示给了 --into 但没给值(usage 错误);未知旗标留在 target 里由
+ *  parseJoinTarget 判为 invalid(“-”开头不是合法 id)。 */
+export type JoinInvocation = { target: JoinTarget; move: boolean; into: string | null };
+
+export function parseJoinInvocation(args: string | null | undefined): JoinInvocation {
+	const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+	const rest: string[] = [];
+	let move = false;
+	let into: string | null = null;
+	for (let i = 0; i < tokens.length; i++) {
+		const tok = tokens[i];
+		if (tok === "--move") {
+			move = true;
+		} else if (tok === "--into") {
+			const value = tokens[i + 1];
+			into = value !== undefined ? value : "";
+			if (value !== undefined) i += 1;
+		} else {
+			rest.push(tok);
+		}
+	}
+	return { target: parseJoinTarget(rest.join(" ")), move, into };
+}
+
+export type MaterializePick =
+	| { kind: "local"; cwdMatch: boolean; dirs: string[]; ref: string }
+	| { kind: "ref"; ref: string }
+	| { kind: "ambiguous"; refs: string[] }
+	| { kind: "empty" };
+
+/** 线程 checkout 在本机的存在性判定(#22):任一 worktree 条目的任一 checkout 目录
+ *  在本机存在 → local(cwdMatch = 当前目录就是其中之一);全部条目都不在本机 →
+ *  恰好一个 foreign 条目时给出可物化的 ref,多个报 ambiguous(不知道该物化谁的),
+ *  线程没有任何 worktree 条目 → empty(无可物化)。local 也带 ref:显式 --move 时
+ *  允许把本机已有 ref 再物化一份新目录。exists 注入以便单测(默认 fs.existsSync)。 */
+export function pickMaterializeCandidate(
+	items: any[],
+	cwd: string,
+	exists: (p: string) => boolean = (p) => fs.existsSync(p),
+): MaterializePick {
+	const rows: any[] = Array.isArray(items) ? items : [];
+	if (rows.length === 0) return { kind: "empty" };
+	const cwdPick = pickWorktreeForCwd(rows, cwd);
+	const localDirs: string[] = [];
+	const foreignRefs: string[] = [];
+	for (const row of rows) {
+		const dirs = worktreeDirs(row);
+		const present = dirs.filter((d) => exists(d));
+		if (present.length > 0) {
+			localDirs.push(...present);
+		} else {
+			const ref = String(row?.reference ?? "");
+			if (ref) foreignRefs.push(ref);
+		}
+	}
+	if (localDirs.length > 0) {
+		return { kind: "local", cwdMatch: cwdPick.ref !== "", dirs: localDirs, ref: String(rows[0]?.reference ?? "") };
+	}
+	if (foreignRefs.length === 1) return { kind: "ref", ref: foreignRefs[0] };
+	if (foreignRefs.length > 1) return { kind: "ambiguous", refs: foreignRefs };
+	return { kind: "empty" };
+}
+
+/** 物化目标目录的默认推导(#22):当前目录的同级,sanitized(thread 标题或 share id)
+ *  前缀 delta-;仅在调用方没给 --into 时使用。纯路径运算,不做 fs 检查。 */
+export function deriveMaterializeDir(cwd: string, seed: string): string {
+	const clean = String(seed ?? "")
+		.replace(/[^A-Za-z0-9._-]+/g, "-")
+		.replace(/^[-.]+/, "")
+		.slice(0, 48)
+		.replace(/[-]+$/, "");
+	const name = "delta-" + (clean || "join");
+	return path.join(path.dirname(String(cwd ?? "")), name);
+}
 
 /** join 失败分类(#17):账号不匹配的干净错误优先(验收标准)。
  *  classifyJoinFailure 只在 thread status 非零退出时调用;能到这里还能命中
@@ -813,6 +889,7 @@ export type DeltaIdentity = {
 	externalId: string;
 	nextSequence: number;
 	worktrees: any[];
+	title?: string;
 };
 
 /** 从 `thread status` 解析可续录的线程身份。
@@ -820,6 +897,7 @@ export type DeltaIdentity = {
 export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
 	const threadId = String(status?.thread_id ?? "");
 	if (!threadId) return null;
+	const title = String(status?.title ?? "").trim();
 	return {
 		threadId,
 		url: String(status?.url ?? ""),
@@ -827,6 +905,7 @@ export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
 		externalId: String(status?.producer?.external_id ?? ""),
 		nextSequence: Number(status?.producer?.next_sequence ?? 0) || 0,
 		worktrees: Array.isArray(status?.worktrees?.items) ? status.worktrees.items : [],
+		...(title ? { title } : {}),
 	};
 }
 
@@ -1412,13 +1491,14 @@ export default function ompDelta(pi: any) {
 	/** 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
 	 *  重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录;
 	 *  cwd 用于重连时检测跨目录恢复,防把旧线程挂到错误 checkout。
-	 *  join 与 share 写同一种标记:reconnectByIdentity 通用,不发明第二套持久化(#17)。 */
-	function persistBinding() {
+	 *  join 与 share 写同一种标记:reconnectByIdentity 通用,不发明第二套持久化(#17)。
+	 *  cwdOverride(#22):物化路径写物化目录(而非当前会话目录),重启后在正确目录恢复。 */
+	function persistBinding(cwdOverride?: string) {
 		try {
 			pi?.appendEntry?.(MARKER_TYPE, {
 				threadId: rt.threadId,
 				worktreeRef: rt.worktreeRef,
-				cwd: rt.cwd,
+				cwd: cwdOverride ?? rt.cwd,
 			});
 		} catch {
 			/* 标记失败不影响本次连接;下次需手动 /delta-share 或 /delta-join */
@@ -1568,15 +1648,13 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	/** /delta-join(#17):把当前会话挂上已有线程 —— share 的另一扇身份解析前门,
-	 *  之后的管线全部复用:worktree 解析 → attach → mount → watch → 游标对齐。
-	 *  身份解析:CLI 的 `thread status` 统一吃 join 链接(https/delta://)、thread_ 分享 id
-	 *  和线程 id(实测三种形态全部直达同一线程),返回 thread_id 与本 producer 游标;
-	 *  游标按 per-producer 隔离,adoptServerCursor 让本会话从“现在”开始跟,不回放他人历史。
-	 *  #22(完整 join:checkout 物化 + /move 指引)是后续:这里不移动、不重建 checkout。 */
-	async function joinShared(target: ResolvableJoinTarget): Promise<void> {
-		// 用 runDelta 保留原文:失败分类需要原文匹配(isUnauthenticatedText / not_visible 签名),
-		// runDeltaJson 会把原文折叠进错误消息导致分类失效
+	/** /delta-join 身份解析前门(#17):CLI 的 `thread status` 统一吃 join 链接
+	 *  (https/delta://)、thread_ 分享 id 和线程 id(实测三种形态全部直达同一线程),
+	 *  返回 thread_id、worktree 列表与本 producer 游标(游标按 per-producer 隔离,
+	 *  adoptServerCursor 让本会话从“现在”开始跟,不回放他人历史)。
+	 *  用 runDelta 保留原文:失败分类需要原文匹配(isUnauthenticatedText / not_visible 签名),
+	 *  runDeltaJson 会把原文折叠进错误消息导致分类失效。 */
+	async function resolveJoinedIdentity(target: ResolvableJoinTarget): Promise<DeltaIdentity> {
 		const r = await runDelta(
 			["thread", "status", target.raw, "--source", SOURCE, "--external-id", rt.sid],
 			{ cwd: rt.cwd },
@@ -1592,25 +1670,97 @@ export default function ompDelta(pi: any) {
 		if (!id) {
 			throw new Error("thread status 未返回 thread_id: " + (r.out || r.err).slice(0, 300));
 		}
+		return id;
+	}
 
+	/** 设置 join 后的线程身份字段(weak 与 materialize 共用)。
+	 *  加入不抢标题:joined 线程的标题属于创建者;置位以抑制 input 处理器的首条 title 记录。 */
+	function adoptJoinedIdentity(id: DeltaIdentity) {
 		rt.threadId = id.threadId;
 		rt.url = id.url || null;
 		rt.visibility = id.visibility ?? null;
-		// 加入不抢标题:joined 线程的标题属于创建者;置位以抑制 input 处理器的首条 title 记录
 		rt.titleSent = true;
-
 		// 服务端游标为权威:join 期间可能已有记录在临时队列(expectingIdentity),统一对齐续接;
 		// 之后 flush 直连该线程 append,无需等 mount(同 share 的首条记录时序)
 		adoptServerCursor(id.nextSequence);
+	}
 
+	/** weak join 尾段(#17):挂当前 checkout —— worktree 解析 → attach → mount → watch。
+	 *  前置条件:调用方已确认当前目录就是想挂的 checkout(weak join 语义)。 */
+	async function attachJoined(id: DeltaIdentity): Promise<void> {
+		adoptJoinedIdentity(id);
 		rt.worktreeRef = await resolveLocalWorktreeRef();
 		await attachAndStream();
 		persistBinding();
-
 		notify(
 			"已加入 Delta 线程:" + rt.threadId +
 				"\n浏览器打开: " + (rt.url ?? "(链接尚未获取,重连后自动更新)") +
 				"\n(当前 checkout 与后续对话正在同步到该线程;退出用 /delta-detach)",
+		);
+	}
+
+	/** worktree mount 物化(#22):`worktree mount <ref> <dir>`(不带 --existing-checkout)
+	 *  把共享 checkout 物化到新目录,ready 行为 {"operation":"mounted","reference","directory"}
+	 *  (实测同 --existing-checkout 形状);进程保持运行,持续同步 —— 它就是新目录的 mount 子进程。
+	 *  resolve 的是 ready 行回显的 directory(以服务端登记为准);超时但目录已落盘时
+	 *  按 attachAndStream 的容忍策略继续(进程留在后台);目录未落盘则报错(mount 子进程已退)。 */
+	function materializeCheckout(ref: string, requestedDir: string): Promise<string> {
+		killChild(rt.mountChild);
+		return new Promise<string>((resolve, reject) => {
+			let settled = false;
+			const finish = (dir: string, err?: string) => {
+				if (settled) return;
+				settled = true;
+				if (err) reject(new Error(err));
+				else resolve(dir);
+			};
+			rt.mountChild = spawnLineChild(
+				["worktree", "mount", ref, requestedDir],
+				(j) => {
+					const d = String(j?.directory ?? "");
+					if (d) finish(d);
+				},
+				(code) => {
+					rt.mountChild = null;
+					if (!settled) {
+						finish("", "worktree mount 物化失败(exit " + code + "):" + requestedDir);
+					} else if (!rt.detaching && rt.connected) {
+						notify("Delta worktree 同步进程退出(exit " + code + ")。", "warning");
+					}
+				},
+			);
+			schedule(() => {
+				if (settled) return;
+				if (fs.existsSync(requestedDir)) finish(requestedDir);
+				else finish("", "worktree mount 物化超时(" + Math.round(MOUNT_READY_TIMEOUT_MS / 1000) + "s)且目录未落盘:" + requestedDir);
+			}, MOUNT_READY_TIMEOUT_MS);
+		});
+	}
+
+	/** full join 尾段(#22):物化线程 checkout 到新目录,并把运行时切到该目录。
+	 *  ref 是线程 status 里的既有 worktree(无需再 worktree attach);mount 子进程
+	 *  即物化目录的持续同步。此后 rt.cwd 指向物化目录(绑定标记也写新目录):
+	 *  omp 会话本体要等用户手动 /move 才迁移(自动化待上游 oh-my-pi#17441),
+	 *  但同步/watch/游标不依赖会话 cwd —— /move 后无缝继续,详见 contract-notes。 */
+	async function materializeJoined(id: DeltaIdentity, ref: string, dir: string): Promise<void> {
+		adoptJoinedIdentity(id);
+		const actual = await materializeCheckout(ref, dir);
+		rt.cwd = actual;
+		rt.worktreeRef = ref;
+		rt.detaching = false;
+		rt.connected = true;
+		rt.connectAttempts = 0;
+		startWatch();
+		void flush();
+		persistBinding(actual);
+		notify(
+			"已物化该线程的 checkout:" + actual +
+				"\n同步进程已启动(持续上传/下载该目录)。" +
+				"\n下一步(需手动;可自动化前需上游 oh-my-pi#17441 支持 agent 调 cd):" +
+				"\n  /move " + actual +
+				"\n迁移后线程绑定与服务端游标不变,watch 持续,同步已指向新目录;重启 omp 请在新目录打开。" +
+				"\n线程:" + rt.threadId +
+				"\n浏览器打开: " + (rt.url ?? "(链接尚未获取,重连后自动更新)"),
 		);
 	}
 
@@ -1808,7 +1958,7 @@ export default function ompDelta(pi: any) {
 	});
 
 	registerDeltaCommand("delta-join", {
-		description: "加入已有 Delta 线程(接受 https://delta.dev/join/…、delta://join/…、thread_ 分享 id 或线程 id):挂载当前 checkout 并开始同步,不移动目录",
+		description: "加入已有 Delta 线程(接受 https://delta.dev/join/…、delta://join/…、thread_ 分享 id 或线程 id;默认挂载当前 checkout;--move 或 --into <绝对路径> 改为物化线程 checkout 到新目录并指引 /move)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
@@ -1820,39 +1970,70 @@ export default function ompDelta(pi: any) {
 				notify("已连接:" + rt.threadId + ";如需换线程,先 /delta-detach 再 /delta-join。");
 				return;
 			}
-			const target = parseJoinTarget(args);
-			if (target.kind === "empty") {
-				notify("用法:/delta-join <link|id>(接受 delta.dev join 链接、thread_ 分享 id 或线程 id)。", "warning");
+			const inv = parseJoinInvocation(args);
+			if (inv.into !== null && !inv.into) {
+				notify("--into 需要一个绝对路径:/delta-join <link|id> --into <dir>。", "warning");
 				return;
 			}
-			if (target.kind === "invalid") {
-				notify("无法识别的 join 目标:" + target.raw + "\n请粘贴完整 join 链接(https://delta.dev/join/… 或 delta://join/…)或线程 id。", "warning");
+			if (inv.into !== null && !path.isAbsolute(inv.into)) {
+				notify("--into 需要绝对路径(物化目录不能依赖会话 cwd):" + inv.into, "warning");
+				return;
+			}
+			if (inv.target.kind === "empty") {
+				notify("用法:/delta-join <link|id> [--move] [--into <dir>]\n目标接受 delta.dev join 链接、thread_ 分享 id 或线程 id;--move(或 --into)物化线程 checkout 到新目录并指引 /move。", "warning");
+				return;
+			}
+			if (inv.target.kind === "invalid") {
+				notify("无法识别的 join 目标:" + inv.target.raw + "\n请粘贴完整 join 链接(https://delta.dev/join/… 或 delta://join/…)或线程 id。", "warning");
 				return;
 			}
 			try {
-				// 与 share 同一道闸门:合约握手 + git checkout 预检,失败原因前置且可读
 				await ensureContractCompatible();
-				assertGitCheckout();
+				// git 预检只属于 weak join(物化路径的当前目录不必是 git checkout,#22)
+				if (!inv.move && inv.into === null) assertGitCheckout();
 			} catch (e) {
 				notify(String(e instanceof Error ? e.message : e), "warning");
 				return;
 			}
-			// 合约要求共享内容(含未提交改动)进入线程前征得同意;非交互环境沿用 share 的回落(告知后继续)
-			if (typeof ctx?.ui?.confirm === "function") {
-				const what = target.kind === "link" || target.kind === "share-id" ? "分享 id " + target.shareId : "线程 " + target.raw;
-				const ok = await ctx.ui.confirm(
-					"加入该 Delta 线程并把当前 checkout 挂上去？",
-					"目标:" + what + "\n共享内容:对话记录与工作区文件,含未提交改动",
-				);
-				if (!ok) {
-					notify("已取消,未加入线程。");
-					return;
-				}
-			} else {
-				notify("将加入目标线程并挂载当前 checkout(含未提交改动)。");
-			}
 			try {
-				await joinShared(target);
+				const id = await resolveJoinedIdentity(inv.target);
+				const pick = pickMaterializeCandidate(id.worktrees, rt.cwd);
+				const what = inv.target.kind === "link" || inv.target.kind === "share-id" ? "分享 id " + inv.target.shareId : "线程 " + inv.target.raw;
+				const explicit = inv.move || inv.into !== null; // --into 隐含 --move;显式参数即知情(同 share 显式参数直达的先例)
+				if (explicit && pick.kind === "local" && pick.cwdMatch) {
+					// --move 但已经在 checkout 里:物化无意义,走 weak join(仍征同意,同 share 恒确认)
+					notify("当前目录已是该线程的 checkout,直接挂载(无需物化)。");
+					if (!(await confirmWeakJoin(ctx, what))) return;
+					await attachJoined(id);
+				} else if (explicit) {
+					await joinWithMaterialize(id, pick, inv);
+				} else if (pick.kind === "local" && pick.cwdMatch) {
+					if (!(await confirmWeakJoin(ctx, what))) return;
+					await attachJoined(id);
+				} else {
+					// 默认 weak join;线程 checkout 不在当前目录时先给一次物化选择,绝不静默挂错目录(#22)
+					let offered = false;
+					if (pick.kind === "local" && typeof ctx?.ui?.confirm === "function") {
+						offered = true;
+						const ok = await ctx.ui.confirm(
+							"该线程的 checkout 不在当前目录,要物化一份到新目录吗？",
+							"本机已有:" + pick.dirs.slice(0, 3).join("; ") +
+								"\n确认 = 物化到新目录并给出 /move 指引" +
+								"\n取消 = 照旧挂载当前目录(weak join)",
+						);
+						if (ok) {
+							await joinWithMaterialize(id, pick, inv);
+							return;
+						}
+					} else if (pick.kind !== "local" && pick.kind !== "empty") {
+						notify("该线程的 checkout 不在本机;/delta-join … --move 可物化到新目录并指引 /move。");
+					} else if (pick.kind === "local") {
+						notify("当前目录不是该线程的 checkout(本机已有: " + pick.dirs.slice(0, 3).join("; ") + ");将照旧挂载当前目录。");
+					}
+					// 物化询问的取消文案已明示“照旧挂载”,不再二次确认
+					if (!offered && !(await confirmWeakJoin(ctx, what))) return;
+					await attachJoined(id);
+				}
 			} catch (e) {
 				// join 的供给窗口与 share 不同源:线程是别人创建的,不自动后台重试(share 的
 				// retryConnect 语义绑定 connectShared);账号不匹配的提示已含重试指引。
@@ -1862,6 +2043,56 @@ export default function ompDelta(pi: any) {
 			}
 		},
 	});
+
+	/** weak join 的合约同意(#17 沿用):共享内容(含未提交改动)进入线程前征得同意;
+	 *  非交互环境沿用 share 的回落(告知后继续)。 */
+	async function confirmWeakJoin(ctx: any, what: string): Promise<boolean> {
+		if (typeof ctx?.ui?.confirm === "function") {
+			const ok = await ctx.ui.confirm(
+				"加入该 Delta 线程并把当前 checkout 挂上去？",
+				"目标:" + what + "\n共享内容:对话记录与工作区文件,含未提交改动",
+			);
+			if (!ok) {
+				notify("已取消,未加入线程。");
+				return false;
+			}
+			return true;
+		}
+		notify("将加入目标线程并挂载当前 checkout(含未提交改动)。");
+		return true;
+	}
+
+	/** join 的物化分支(#22):决定物化目标与 ref 后走 materializeJoined。
+	 *  pick.local 且 cwdMatch → 不物化(已在 checkout 里);local 他处 → 用第一个条目的 ref
+	 *  再物化一份;ambiguous/empty 的错误见 pickMaterializeCandidate。物化目录:
+	 *  --into 显式指定,否则由线程标题/分享 id 推导(当前目录同级);已存在则要求 --into。
+	 *  consent 已由调用方完成(显式 --move/--into,或物化询问的确认)。 */
+	async function joinWithMaterialize(
+		id: DeltaIdentity,
+		pick: MaterializePick,
+		inv: JoinInvocation,
+	): Promise<void> {
+		let ref: string;
+		if (pick.kind === "ref" || pick.kind === "local") {
+			// local 只可能是“本机他处”(cwdMatch 已在 handler 里拦下):显式要求下,用
+			// 第一个条目的 ref 再物化一份新目录
+			ref = pick.ref;
+		} else if (pick.kind === "ambiguous") {
+			throw new Error(
+				"该线程有多个不在本机的 worktree,无法确定要物化哪一个:\n  " +
+					pick.refs.map((r) => r.slice(0, 60)).join("\n  ") +
+					"\n请在正确的 checkout 目录里 weak join,或联系线程创建者确认。",
+			);
+		} else {
+			throw new Error("该线程没有任何 worktree 可物化;请让创建者先挂载 checkout,或在你的 checkout 目录里 weak join。");
+		}
+		const seed = id.title || (inv.target.kind === "link" || inv.target.kind === "share-id" ? inv.target.shareId : "") || id.threadId;
+		const dir = inv.into ?? deriveMaterializeDir(rt.cwd, seed);
+		if (fs.existsSync(dir)) {
+			throw new Error("物化目录已存在:" + dir + ";请用 --into <绝对路径> 指定一个不存在的目录。");
+		}
+		await materializeJoined(id, ref, dir);
+	}
 
 	registerDeltaCommand("delta-status", {
 		description: "查看 omp-delta 连接与同步状态",

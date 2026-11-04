@@ -50,6 +50,12 @@ describe("resolveIdentityFromStatus", () => {
 		assert.equal(id?.nextSequence, 0);
 		assert.deepEqual(id?.worktrees, []);
 		assert.equal(id?.url, "");
+		assert.equal(id?.title, undefined);
+	});
+
+	it("carries the thread title when present (#22: materialize-dir seed)", () => {
+		const id = resolveIdentityFromStatus(LIVE_STATUS);
+		assert.equal(id?.title, "Recorded conversation");
 	});
 
 	it("returns null when there is no thread to resume", () => {
