@@ -28,6 +28,22 @@ flows; this page records details it does not spell out.
 
 - A thread created `private` with `--organization` uploads without an explicit `thread share`.
 
+#5/#29 probing (live E2E of the history backfill, 2026-11-05) — two new CLI observations:
+
+- **Post-upload provisioning error**: right after records are accepted, `thread append` can still
+  exit non-zero with `the history is unavailable: NotFound` while the sync is in its
+  `PlanningRemoteHistory` phase (stdout leads with
+  `delta: synchronizing thread: UploadingDeltas/PlanningRemoteHistory`). The records ARE on the
+  server (sequence dedup makes the plugin's retryable-retry path harmless) — but the window can run
+  minutes, long enough for `/delta-share`'s later attach stage to exhaust its retries and report
+  failure even though the export landed. Track: issue #32.
+- **Server-scoped toolCallId**: the server prefixes recorded toolCallIds with a producer/session
+  scope (`sess-…/r3-read-1` observed in read-back items). Both plausible derivations (full external
+  id vs producer name) have counterexamples; needs a dedicated probe. Track: issue #33.
+- The backfill itself verified clean on all three issues (#29/#30/#31): transcript order, tool cards
+  with rawInput/diff and the `edit` activity kind, `turn_id` grouping from the joiner's read-back
+  (`thread watch` without `--source/--external-id`), and re-share dedup via the empty-thread guard.
+
 ## Join links
 
 `thread status` → `.url` is the real join URL (`https://delta.dev/join/thread_01…`).
