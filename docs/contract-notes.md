@@ -57,6 +57,53 @@ construct join links from the create id. `status` also exposes
   belongs to its creator (`titleSent` is preset to suppress the input handler's
   first-record title).
 
+## /move (#22) — source-level research (pi-coding-agent 18.16.0, not live-verified)
+
+Findings from reading the installed bundle (`node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`,
+TUI `handleMoveCommand` → `session.moveSession` → `sessionManager.moveTo` → `applyCwdChange`):
+
+- **What /move does**: refuses while streaming; interactive dir picker without an arg.
+  Then: flush settings → `sessionManager.moveTo(newDir)` → `applyCwdChange(newDir)`.
+- **What moves**: the session JSONL file and the session's artifacts directory are
+  **renamed** into the new project's session storage (same basename; EXDEV falls back to
+  copy; the header's `cwd` field is rewritten and persisted).
+- **All-or-nothing + rollback**: artifacts rename rolls back if the session-file rename
+  fails and vice versa ("Failed to move artifacts and rollback"). If the post-move
+  `applyCwdChange` fails, the TUI rolls the move back (`rollbackMove`) and re-aligns the
+  workspace to the restored cwd; if even that fails it escalates to a full `shutdown()`.
+- **Lease guards**: moving onto a session another live omp process writes is refused
+  ("another live omp process writes the session there. Nothing was moved.").
+- **Extension lifecycle**: extensions are NOT re-instantiated and NO extension event fires
+  (`session_start/switch/branch/tree/shutdown` is the whole lifecycle vocabulary).
+  `applyCwdChange` = `chdir` + settings rescope for the new cwd (`reloadForCwd`) +
+  title-system-prompt and skills/commands refresh. An extension's Runtime survives /move
+  with the same session id; later command handlers see the NEW cwd via `ctx.cwd`.
+- **Manual-step boundary**: there is no agent-callable cwd change (checked: the `omp
+  session` CLI covers machine handoff pack/unpack/moved/lease only). The extension prints
+  the exact `/move <dir>` command; automation lands with upstream can1357/oh-my-pi#17441.
+- **Consequence for omp-delta (#22)**: mount/watch children spawned before /move keep
+  running. For the materialize-join flow this is exactly right — the mount child IS the
+  materialized directory's sync, and watch is thread-scoped — so sync continues across
+  /move with no remount. `rt.cwd` stays stale (old dir) until the next command handler
+  refreshes it from `ctx.cwd`; only cosmetic (spawn cwd for delta CLI calls). Known
+  limitation (documented, not handled): if watch drops BEFORE the user runs /move,
+  `/delta-retry` re-attaches using the stale old cwd — the materialized mount child keeps
+  running regardless, and post-/move retries adopt the materialized checkout via
+  `--existing-checkout`.
+
+#22 probing (delta 0.23.0, live):
+
+- `delta --json worktree mount <ref> <new-dir>` (no `--existing-checkout`) materializes
+  a shared checkout into a fresh directory and prints the same compact ready line as the
+  adopt variant: `{"operation":"mounted","reference":"…","directory":"<abs dir>"}`.
+  The process keeps running and syncs that directory (it becomes the mount child).
+- The materialized directory registers under the thread's `status.worktrees.items[]`
+  as `checkouts[].directory` (observed `state:"detached"` after the mount process ends),
+  so restart-at-new-dir discovery matches by cwd exactly (and `marker.worktreeRef` is
+  the fallback).
+- `omp session` CLI actions are pack/unpack/moved/lease (machine handoff), NOT an
+  in-process move — no automation path for the relocation step.
+
 ## Worktrees
 
 - `worktree create` requires the repository to have a **Git remote**: Delta backfills blob content from it, and a fake/unreachable remote only fails later, when a client tries to materialize the checkout (`remote returned no git blobs …`).
