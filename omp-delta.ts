@@ -18,7 +18,8 @@
  * 零本地状态(#10):线程身份以 DeltaDB 为权威,绑定关系写在 omp 会话记录里
  * (appendEntry 自定义条目),送达游标以服务端 next_sequence 为权威。
  *
- * 安装:复制本文件到 ~/.omp/agent/extensions/omp-delta.ts,重启 omp。
+ * 安装:omp plugin install 'github:Samuka007/omp-delta'(或本地开发 omp plugin link ./),重启 omp;
+ * Windows 上 installer 静默失败时,在 ~/.omp/plugins 里 npm install 'github:Samuka007/omp-delta' 等价(见 README)。
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
