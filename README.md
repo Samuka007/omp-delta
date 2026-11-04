@@ -34,7 +34,7 @@ Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp runn
 > cd ~/.omp/plugins && npm install 'github:Samuka007/omp-delta'
 > ```
 >
-> The result is identical to a successful `omp plugin install` (`omp plugin list` shows `omp-delta@0.1.0`).
+> The result is identical to a successful `omp plugin install` (`omp plugin list` shows `omp-delta@0.2.0`).
 
 ## Known limits (MVP)
 
