@@ -14,5 +14,14 @@
 	},
 	"omp": {
 		"extensions": ["./omp-delta.ts"]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "bun test"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^18.16.0",
+		"@types/node": "^26.6.6",
+		"typescript": "^7.0.2"
 	}
 }

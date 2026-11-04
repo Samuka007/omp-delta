@@ -182,14 +182,14 @@ describe("buildAppendEnvelope", () => {
 
 describe("liveActivity", () => {
 	it("marks user/agent/thought messages with activity kind", () => {
-		const out = liveActivity({ sessionUpdate: "agent_message", content: [] });
+		const out = liveActivity({ sessionUpdate: "agent_message", content: [] }) as any;
 		assert.equal(out._meta.delta.activity_kind, "agent_message");
 		assert.equal(out._meta.delta.work_origin, "external_agent");
 		assert.equal(out._meta.delta.interaction_surface, "cli");
 	});
 
 	it("maps tool_call_update to tool_call", () => {
-		const out = liveActivity({ sessionUpdate: "tool_call_update", toolCallId: "x" });
+		const out = liveActivity({ sessionUpdate: "tool_call_update", toolCallId: "x" }) as any;
 		assert.equal(out._meta.delta.activity_kind, "tool_call");
 	});
 
