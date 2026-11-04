@@ -248,6 +248,13 @@ function runDeltaJsonFromText(out: string, err: string): any {
  *  实测签名来自 delta.exe 内嵌错误串:not signed in / authentication required。 */
 const ORG_UNAUTH_HINT = "Delta CLI 未登录:请先运行 delta auth login(或在 Delta 应用内登录)后重试。";
 
+/** /delta-join 账号不匹配的统一可操作提示(#17)。
+ *  实测签名:他人私有/不存在的分享 id → not_visible "shared thread is absent or not visible";
+ *  不属于本账号的线程 id / 链接有误 → invalid_reference "…exact thread ID in this account"。
+ *  刚创建的线程仍在供给期时是同一签名(not_visible),提示里带上这一点。 */
+const JOIN_MISMATCH_HINT =
+	"无法加入该线程:它对当前账号不可见 —— 通常因为线程属于其他账号(私有未共享给你)、链接或 ID 有误,或线程刚创建仍在供给中(可稍后重试)。";
+
 /** 当前选中的组织(创建线程时必须显式指定)。 */
 async function resolveOrg(): Promise<{ id: string; name: string }> {
 	const r = await runDelta(["org", "current"]);
@@ -313,27 +320,27 @@ export async function pickShareVisibility(
 // ---- /delta 路由(#15):单一入口;平铺命令保持原样作为别名 ----
 
 /** /delta 路由决策:menu = 无参数(用法菜单,不是错误);route = 已实现子命令(转发同一 handler);
- *  unimplemented = 已知但未实现(join,#17);unknown = 未知子命令。 */
+ *  unknown = 未知子命令。 */
 export type DeltaRouteDecision =
 	| { kind: "menu" }
-	| { kind: "route"; command: "delta-share" | "delta-status" | "delta-detach" | "delta-retry"; args: string }
-	| { kind: "unimplemented"; command: "join" }
+	| { kind: "route"; command: "delta-share" | "delta-status" | "delta-detach" | "delta-retry" | "delta-join"; args: string }
 	| { kind: "unknown"; command: string };
 
 /** 解析 `/delta <子命令> [剩余参数]`(#15):大小写不敏感,空白折叠。
  *  子命令与平铺命令一一对应:share→delta-share、status→delta-status、detach→delta-detach、
- *  retry→delta-retry;join 尚未实现(#17)。/delta-org、/delta-update 不在路由内(有独立拼写,菜单里指引)。 */
+ *  retry→delta-retry、join→delta-join(#17)。
+ *  /delta-org、/delta-update 不在路由内(有独立拼写,菜单里指引)。 */
 export function parseDeltaRouter(args: string): DeltaRouteDecision {
 	const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
 	if (parts.length === 0) return { kind: "menu" };
 	const sub = parts[0].toLowerCase();
 	const rest = parts.slice(1).join(" ");
-	if (sub === "join") return { kind: "unimplemented", command: "join" };
-	const route: Record<string, "delta-share" | "delta-status" | "delta-detach" | "delta-retry"> = {
+	const route: Record<string, "delta-share" | "delta-status" | "delta-detach" | "delta-retry" | "delta-join"> = {
 		share: "delta-share",
 		status: "delta-status",
 		detach: "delta-detach",
 		retry: "delta-retry",
+		join: "delta-join",
 	};
 	const command = route[sub];
 	if (!command) return { kind: "unknown", command: sub };
@@ -345,13 +352,61 @@ export function renderDeltaMenu(): string {
 	return [
 		"delta — omp-delta 命令路由:",
 		"  /delta share [private]   连接当前会话(= /delta-share)",
+		"  /delta join <link|id>    加入已有线程并挂载当前 checkout(= /delta-join)",
 		"  /delta status            查看连接与同步状态(= /delta-status)",
 		"  /delta retry             恢复/重试推送(= /delta-retry)",
 		"  /delta detach            断开同步(= /delta-detach)",
-		"  /delta join <link|id>    加入已有线程(尚未实现:#17)",
 		"  其他命令:/delta-org list|current · /delta-update [check]",
-		"  平铺别名继续可用:/delta-share /delta-status /delta-detach /delta-retry",
+		"  平铺别名继续可用:/delta-share /delta-join /delta-status /delta-detach /delta-retry",
 	].join("\n");
+}
+
+// ---- /delta-join(#17):弱加入 —— 不搬家、不物化 checkout,把当前 checkout 挂上已有线程 ----
+// #22(完整 join:checkout 物化 + /move 指引)是有意留出的后续:这里的接缝只认目标,不动目录。
+
+export type JoinTarget =
+	| { kind: "link"; shareId: string; raw: string }
+	| { kind: "share-id"; shareId: string; raw: string }
+	| { kind: "thread-id"; raw: string }
+	| { kind: "invalid"; raw: string }
+	| { kind: "empty" };
+
+// 实测形态(delta 0.23.0):join 链接 https://delta.dev/join/<share-id> 或 delta://join/<share-id>;
+// share id 形如 thread_01m6jt5nyc4znwdfcg9p2mk49d(与 thread id 无派生关系,见 contract-notes);
+// 线程 id 是不透明长 token(含字母/数字/-/_)。链接尾部允许一个 /;query/hash 一律算 invalid(粘贴噪音应自己清掉)。
+const JOIN_LINK_RE = /^(?:https:\/\/delta\.dev\/join\/|delta:\/\/join\/)([A-Za-z0-9][A-Za-z0-9_-]*)\/?$/i;
+const JOIN_SHARE_ID_RE = /^thread_[A-Za-z0-9_-]+$/;
+const JOIN_PLAUSIBLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/** 解析 /delta-join 参数(#17):delta.dev join 链接(https 或 delta://)、thread_ 分享 id、
+ *  或裸线程 id。链接形态提取 shareId 供展示;三种可解析形态的原文都交给
+ *  `delta thread status <raw>` —— CLI 侧统一解析(实测三种形态全部直达同一线程)。
+ *  empty = 没给参数;invalid = 含空白/路径分隔符/query 等不可能成为 id 的输入,
+ *  在本地直接报错,不劳 CLI。 */
+export function parseJoinTarget(args: string | null | undefined): JoinTarget {
+	const raw = String(args ?? "").trim();
+	if (!raw) return { kind: "empty" };
+	const link = JOIN_LINK_RE.exec(raw);
+	if (link) return { kind: "link", shareId: link[1], raw };
+	if (JOIN_SHARE_ID_RE.test(raw)) return { kind: "share-id", shareId: raw, raw };
+	if (JOIN_PLAUSIBLE_ID_RE.test(raw)) return { kind: "thread-id", raw };
+	return { kind: "invalid", raw };
+}
+
+export type JoinFailureKind = "unauthenticated" | "account-mismatch" | "unknown";
+
+/** parseJoinTarget 中可直接交给 CLI 解析的三种形态(link/share-id/thread-id);
+ *  empty/invalid 在本地拦截,永不进入 joinShared。 */
+export type ResolvableJoinTarget = Extract<JoinTarget, { kind: "link" | "share-id" | "thread-id" }>;
+
+/** join 失败分类(#17):账号不匹配的干净错误优先(验收标准)。
+ *  classifyJoinFailure 只在 thread status 非零退出时调用;能到这里还能命中
+ *  invalid_reference/not_visible 的,都是“存在性/可见性”层面的拒绝 —— 语法层面的
+ *  垃圾输入已被 parseJoinTarget 的 invalid 拦在本地。 */
+export function classifyJoinFailure(text: string): JoinFailureKind {
+	if (isUnauthenticatedText(text)) return "unauthenticated";
+	if (/not_visible|shared thread is absent|not in this account|invalid_reference/i.test(text)) return "account-mismatch";
+	return "unknown";
 }
 
 /** 未登录判定:对 delta 的 stdout+stderr 原文做签名匹配(不区分 JSON/纯文本)。 */
@@ -1053,6 +1108,8 @@ export default function ompDelta(pi: any) {
 		}
 
 		// mount 上传 checkout 并持续同步;ready 行出现即继续,进程保持运行
+		// 重连/换线程时先杀旧 mount(同 startWatch 对 watch 的处理),防孤儿同步进程双写
+		killChild(rt.mountChild);
 		await new Promise<void>((resolveMount) => {
 			let settled = false;
 			const settle = () => {
@@ -1081,8 +1138,8 @@ export default function ompDelta(pi: any) {
 		void flush();
 	}
 
-	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
-	async function connectShared(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
+	/** 合约握手(share 与 join 共用):CLI 支持区间必须与本插件实现区间有交集。 */
+	async function ensureContractCompatible(): Promise<void> {
 		const contract = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
 		const min = Number(contract?.min ?? 0);
 		const max = Number(contract?.max ?? 0);
@@ -1092,9 +1149,10 @@ export default function ompDelta(pi: any) {
 		if (min > CONTRACT_MAX) {
 			throw new Error("delta CLI 合约更新(min " + min + "),请更新 omp-delta 插件。");
 		}
+	}
 
-		// 同 source + external-id 幂等:重试/崩溃恢复都安全
-		// 预检 git 仓库：worktree 挂载需要 git checkout，提前报错更可读
+	/** git checkout 预检(share 与 join 共用):worktree 挂载需要 git checkout + remote,提前报错更可读。 */
+	function assertGitCheckout(): void {
 		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rt.cwd, windowsHide: true });
 		if (g.status !== 0) {
 			throw new Error("当前目录不是 git 仓库,worktree 无法挂载:" + rt.cwd);
@@ -1103,6 +1161,48 @@ export default function ompDelta(pi: any) {
 		if (!String(remotes.stdout ?? "").trim()) {
 			throw new Error("仓库没有 Git remote,Delta worktree 创建会失败:先 git remote add origin …");
 		}
+	}
+
+	/** 当前 checkout 的 worktree 身份(share 与 join 共用,参考 delta-claude checkoutReference 语义):
+	 *  list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报歧义让人选。
+	 *  join 场景:本地从未作为 worktree 接入时 create 一个新身份,attach 到目标线程 ——
+	 *  线程里由此并存多个参与者的 worktree(Delta 的多 worktree 模型)。 */
+	async function resolveLocalWorktreeRef(): Promise<string> {
+		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
+		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
+		const pick = pickWorktreeForCwd(rows, rt.cwd);
+		if (pick.ambiguous) {
+			throw new Error("该 checkout 存在多个 worktree 身份,请先在 Delta 里选择正确的一个后重试。");
+		}
+		let ref = pick.ref;
+		if (!ref) {
+			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
+			ref = String(w?.reference ?? "");
+		}
+		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
+		return ref;
+	}
+
+	/** 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
+	 *  重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录;
+	 *  cwd 用于重连时检测跨目录恢复,防把旧线程挂到错误 checkout。
+	 *  join 与 share 写同一种标记:reconnectByIdentity 通用,不发明第二套持久化(#17)。 */
+	function persistBinding() {
+		try {
+			pi?.appendEntry?.(MARKER_TYPE, {
+				threadId: rt.threadId,
+				worktreeRef: rt.worktreeRef,
+				cwd: rt.cwd,
+			});
+		} catch {
+			/* 标记失败不影响本次连接;下次需手动 /delta-share 或 /delta-join */
+		}
+	}
+
+	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
+	async function connectShared(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
+		await ensureContractCompatible();
+		assertGitCheckout();
 
 		// 组织已在命令处理器里确认对话框之前解析(resolveOrg),这里直接使用
 		// 同 source + external-id 幂等:重试/崩溃恢复都安全
@@ -1156,36 +1256,12 @@ export default function ompDelta(pi: any) {
 			emit({ sessionUpdate: "session_info_update", title: (title || "omp session").slice(0, 120) });
 		}
 
-		// worktree 身份(参考 delta-claude checkoutReference 语义):
-		// list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报歧义让人选。
-		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
-		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
-		const pick = pickWorktreeForCwd(rows, rt.cwd);
-		if (pick.ambiguous) {
-			throw new Error("该 checkout 存在多个 worktree 身份,请先在 Delta 里选择正确的一个后重试。");
-		}
-		let ref = pick.ref;
-		if (!ref) {
-			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
-			ref = String(w?.reference ?? "");
-		}
-		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
-		rt.worktreeRef = ref;
+		// worktree 身份:复用同 checkout 的既有身份或新建(见 resolveLocalWorktreeRef)
+		rt.worktreeRef = await resolveLocalWorktreeRef();
 
 		await attachAndStream();
 
-		// 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
-		// 重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录;
-		// cwd 用于重连时检测跨目录恢复,防把旧线程挂到错误 checkout。
-		try {
-			pi?.appendEntry?.(MARKER_TYPE, {
-				threadId: rt.threadId,
-				worktreeRef: rt.worktreeRef,
-				cwd: rt.cwd,
-			});
-		} catch {
-			/* 标记失败不影响本次连接;下次需手动 /delta-share */
-		}
+		persistBinding();
 
 		notify(
 			"Delta 线程已连接:" +
@@ -1213,6 +1289,52 @@ export default function ompDelta(pi: any) {
 			}
 			notify("Delta 重连失败:" + msg, "warning");
 		}
+	}
+
+	/** /delta-join(#17):把当前会话挂上已有线程 —— share 的另一扇身份解析前门,
+	 *  之后的管线全部复用:worktree 解析 → attach → mount → watch → 游标对齐。
+	 *  身份解析:CLI 的 `thread status` 统一吃 join 链接(https/delta://)、thread_ 分享 id
+	 *  和线程 id(实测三种形态全部直达同一线程),返回 thread_id 与本 producer 游标;
+	 *  游标按 per-producer 隔离,adoptServerCursor 让本会话从“现在”开始跟,不回放他人历史。
+	 *  #22(完整 join:checkout 物化 + /move 指引)是后续:这里不移动、不重建 checkout。 */
+	async function joinShared(target: ResolvableJoinTarget): Promise<void> {
+		// 用 runDelta 保留原文:失败分类需要原文匹配(isUnauthenticatedText / not_visible 签名),
+		// runDeltaJson 会把原文折叠进错误消息导致分类失效
+		const r = await runDelta(
+			["thread", "status", target.raw, "--source", SOURCE, "--external-id", rt.sid],
+			{ cwd: rt.cwd },
+		);
+		if (r.code !== 0) {
+			const blob = r.err + "\n" + r.out;
+			const kind = classifyJoinFailure(blob);
+			if (kind === "unauthenticated") throw new Error(ORG_UNAUTH_HINT);
+			if (kind === "account-mismatch") throw new Error(JOIN_MISMATCH_HINT);
+			throw new Error("thread status 失败(code " + r.code + "): " + (r.err || r.out).slice(0, 300));
+		}
+		const id = resolveIdentityFromStatus(runDeltaJsonFromText(r.out, r.err));
+		if (!id) {
+			throw new Error("thread status 未返回 thread_id: " + (r.out || r.err).slice(0, 300));
+		}
+
+		rt.threadId = id.threadId;
+		rt.url = id.url || null;
+		rt.visibility = id.visibility ?? null;
+		// 加入不抢标题:joined 线程的标题属于创建者;置位以抑制 input 处理器的首条 title 记录
+		rt.titleSent = true;
+
+		// 服务端游标为权威:join 期间可能已有记录在临时队列(expectingIdentity),统一对齐续接;
+		// 之后 flush 直连该线程 append,无需等 mount(同 share 的首条记录时序)
+		adoptServerCursor(id.nextSequence);
+
+		rt.worktreeRef = await resolveLocalWorktreeRef();
+		await attachAndStream();
+		persistBinding();
+
+		notify(
+			"已加入 Delta 线程:" + rt.threadId +
+				"\n浏览器打开: " + (rt.url ?? "(链接尚未获取,重连后自动更新)") +
+				"\n(当前 checkout 与后续对话正在同步到该线程;退出用 /delta-detach)",
+		);
 	}
 
 	function detach(quiet = false) {
@@ -1288,6 +1410,13 @@ export default function ompDelta(pi: any) {
 			);
 			const id = resolveIdentityFromStatus(st);
 			if (!id) throw new Error("thread status 未返回 thread_id");
+			// 等待 status 期间用户手动 /delta-share 或 /delta-join 已绑定其他线程:
+			// 过期重连就此放弃,不覆盖前台身份(#17 join 让这个交错更常见)
+			if (rt.threadId && rt.seqReady) {
+				notify("后台重连取消:会话已手动绑定线程 " + rt.threadId + "。");
+				rt.expectingIdentity = false;
+				return;
+			}
 			// omp -r 恢复会话会 fork 出新 sid:marker 在、external_id 不同 → 以新 producer
 			// 身份重绑同一线程(per-producer 游标独立,不会重复);无需用户重新 /delta-share。
 			if (id.externalId && id.externalId !== rt.sid) {
@@ -1397,6 +1526,62 @@ export default function ompDelta(pi: any) {
 					return;
 				}
 				notify("连接失败:" + msg, "warning");
+			}
+		},
+	});
+
+	registerDeltaCommand("delta-join", {
+		description: "加入已有 Delta 线程(接受 https://delta.dev/join/…、delta://join/…、thread_ 分享 id 或线程 id):挂载当前 checkout 并开始同步,不移动目录",
+		handler: async (args: string, ctx: any) => {
+			lastCtx = ctx;
+			rt.cwd = String(ctx?.cwd ?? rt.cwd);
+			if (rt.isSub) {
+				notify("子代理会话暂不支持连接 Delta。", "warning");
+				return;
+			}
+			if (rt.connected) {
+				notify("已连接:" + rt.threadId + ";如需换线程,先 /delta-detach 再 /delta-join。");
+				return;
+			}
+			const target = parseJoinTarget(args);
+			if (target.kind === "empty") {
+				notify("用法:/delta-join <link|id>(接受 delta.dev join 链接、thread_ 分享 id 或线程 id)。", "warning");
+				return;
+			}
+			if (target.kind === "invalid") {
+				notify("无法识别的 join 目标:" + target.raw + "\n请粘贴完整 join 链接(https://delta.dev/join/… 或 delta://join/…)或线程 id。", "warning");
+				return;
+			}
+			try {
+				// 与 share 同一道闸门:合约握手 + git checkout 预检,失败原因前置且可读
+				await ensureContractCompatible();
+				assertGitCheckout();
+			} catch (e) {
+				notify(String(e instanceof Error ? e.message : e), "warning");
+				return;
+			}
+			// 合约要求共享内容(含未提交改动)进入线程前征得同意;非交互环境沿用 share 的回落(告知后继续)
+			if (typeof ctx?.ui?.confirm === "function") {
+				const what = target.kind === "link" || target.kind === "share-id" ? "分享 id " + target.shareId : "线程 " + target.raw;
+				const ok = await ctx.ui.confirm(
+					"加入该 Delta 线程并把当前 checkout 挂上去？",
+					"目标:" + what + "\n共享内容:对话记录与工作区文件,含未提交改动",
+				);
+				if (!ok) {
+					notify("已取消,未加入线程。");
+					return;
+				}
+			} else {
+				notify("将加入目标线程并挂载当前 checkout(含未提交改动)。");
+			}
+			try {
+				await joinShared(target);
+			} catch (e) {
+				// join 的供给窗口与 share 不同源:线程是别人创建的,不自动后台重试(share 的
+				// retryConnect 语义绑定 connectShared);账号不匹配的提示已含重试指引。
+				// 撤销 title 抑制:加入失败后,后续 /delta-share 仍应发首条 title
+				rt.titleSent = false;
+				notify("加入失败:" + String(e instanceof Error ? e.message : e), "warning");
 			}
 		},
 	});
@@ -1532,18 +1717,14 @@ export default function ompDelta(pi: any) {
 		},
 	});
 
-	// /delta 路由(#15):转发到平铺命令的同一 handler;无参数输出用法菜单而非报错
+	// /delta 路由(#15,#17):转发到平铺命令的同一 handler;无参数输出用法菜单而非报错
 	pi.registerCommand("delta", {
-		description: "omp-delta 命令路由:/delta share|status|retry|detach(无参数显示用法;平铺命令仍可用)",
+		description: "omp-delta 命令路由:/delta share|join|status|retry|detach(无参数显示用法;平铺命令仍可用)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			const d = parseDeltaRouter(args);
 			if (d.kind === "menu") {
 				notify(renderDeltaMenu());
-				return;
-			}
-			if (d.kind === "unimplemented") {
-				notify("/delta join 尚未实现(#17):weak join 落地前,请先在 Delta 侧复制 join 链接并等待该能力上线。", "warning");
 				return;
 			}
 			if (d.kind === "unknown") {

@@ -11,9 +11,10 @@ A community implementation of the [officially documented plugin contract](https:
 - Teammate comments in Delta flow back into omp context as follow-ups (never auto-trigger a turn)
 - Someone takes over the thread → the local turn stops (`superseded` / `fenced`)
 - Zero local state: thread identity lives in the omp session record + DeltaDB, the delivery cursor is the server's `next_sequence`; undelivered records queue in memory and retryable failures back off automatically
+- `/delta-join <link|id>` — join an existing shared thread from a `delta.dev` join link (`https://` or `delta://`), a `thread_…` share id, or a thread id: mounts the **current** checkout (no directory move), adopts the per-producer cursor so you follow from now instead of replaying history, and keeps this session's records flowing into the same thread; `/delta-detach` exits. Weak join (#17): no checkout materialization / `/move` guidance — that's follow-up #22
 - `/delta-status`, `/delta-detach`, `/delta-retry` for connection management; `/delta-org list|current` for read-only org inspection (no switching)
 - `/delta-update [check]` checks (`check`) or installs Delta updates — output always carries a reinstall hint for this plugin, since omp has no marketplace auto-update
-- `/delta share|status|retry|detach` routes to the same flows with a usage menu on no arguments; the flat `/delta-*` commands keep working unchanged as aliases (`join` is not implemented yet, #17)
+- `/delta share|join|status|retry|detach` routes to the same flows with a usage menu on no arguments; the flat `/delta-*` commands keep working unchanged as aliases
 
 ## Install
 

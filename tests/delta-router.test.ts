@@ -37,9 +37,24 @@ describe("parseDeltaRouter", () => {
 		assert.deepEqual(parseDeltaRouter("Retry fast"), { kind: "route", command: "delta-retry", args: "fast" });
 	});
 
-	it("join is known but unimplemented (#17)", () => {
-		assert.deepEqual(parseDeltaRouter("join"), { kind: "unimplemented", command: "join" });
-		assert.deepEqual(parseDeltaRouter("JOIN delta://thread/x"), { kind: "unimplemented", command: "join" });
+	it("routes join with the link/id verbatim as remaining args (#17)", () => {
+		assert.deepEqual(parseDeltaRouter("join"), { kind: "route", command: "delta-join", args: "" });
+		assert.deepEqual(parseDeltaRouter("JOIN https://delta.dev/join/thread_01x"), {
+			kind: "route",
+			command: "delta-join",
+			args: "https://delta.dev/join/thread_01x",
+		});
+		assert.deepEqual(parseDeltaRouter("join delta://join/thread_01x"), {
+			kind: "route",
+			command: "delta-join",
+			args: "delta://join/thread_01x",
+		});
+		assert.deepEqual(parseDeltaRouter("join thread_01abc"), { kind: "route", command: "delta-join", args: "thread_01abc" });
+		assert.deepEqual(parseDeltaRouter("  join    ksQQabcDEF-_x  "), {
+			kind: "route",
+			command: "delta-join",
+			args: "ksQQabcDEF-_x",
+		});
 	});
 
 	it("unknown subcommand reports the lowered name", () => {
@@ -55,14 +70,16 @@ describe("parseDeltaRouter", () => {
 });
 
 describe("renderDeltaMenu", () => {
-	it("lists every routed subcommand, the unimplemented join, and the flat aliases", () => {
+	it("lists every routed subcommand and the flat aliases", () => {
 		const menu = renderDeltaMenu();
-		for (const expected of ["share", "status", "retry", "detach", "join", "/delta-share", "/delta-status", "/delta-detach", "/delta-retry", "/delta-org", "/delta-update", "#17"]) {
+		for (const expected of ["share", "join", "status", "retry", "detach", "/delta-share", "/delta-join", "/delta-status", "/delta-detach", "/delta-retry", "/delta-org", "/delta-update"]) {
 			assert.ok(menu.includes(expected), "menu should mention " + expected);
 		}
 	});
 
-	it("marks join as not yet implemented, not as an error path", () => {
-		assert.ok(/尚未实现/.test(renderDeltaMenu()));
+	it("no longer marks join as unimplemented (#17 shipped)", () => {
+		const menu = renderDeltaMenu();
+		assert.ok(!menu.includes("尚未实现"));
+		assert.ok(!menu.includes("#17"));
 	});
 });

@@ -35,6 +35,28 @@ The share id (`thread_01…`) is **not** the id returned by `thread create` — 
 construct join links from the create id. `status` also exposes
 `.producer.next_sequence` and `.turn.status`, both handy for status displays.
 
+#17 probing (delta 0.23.0, live, 2026-11-05) — what `/delta-join` builds on:
+
+- `thread status <arg>` resolves the **same thread** for all of: bare thread id,
+  bare share id (`thread_01…`), `https://delta.dev/join/<share-id>`, and
+  `delta://join/<share-id>`. The CLI owns link→thread resolution; the plugin never
+  parses links itself. All forms **require** `--source/--external-id` (clap rejects
+  the command without them).
+- Producer rows materialize on first `status`: a never-appended producer already
+  shows `producer.next_sequence: 1`. Cursors are per-producer — joining an existing
+  thread does NOT replay the other producer's history; you follow from now.
+- `.access` is `{"state":"granted","is_owner":…}`; a thread not visible from this
+  account fails instead:
+  - foreign/absent share id → exit 1, `code:"not_visible"`, "shared thread is absent
+    or not visible" (`retryable:false`). Unlike the share path's self-inflicted
+    provisioning window, join surfaces this as a hard account/visibility error
+    (hint text still mentions the just-created provisioning caveat).
+  - foreign/malformed thread id → exit 1, `code:"invalid_reference"`, "expected a
+    supported Delta link, share ID, or exact thread ID in this account".
+- `/delta-join` deliberately sends no title record: the joined thread's title
+  belongs to its creator (`titleSent` is preset to suppress the input handler's
+  first-record title).
+
 ## Worktrees
 
 - `worktree create` requires the repository to have a **Git remote**: Delta backfills blob content from it, and a fake/unreachable remote only fails later, when a client tries to materialize the checkout (`remote returned no git blobs …`).
