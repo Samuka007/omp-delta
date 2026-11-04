@@ -11,9 +11,9 @@ import {
 	type ProjectPolicy,
 } from "../omp-delta.ts";
 
-// live-format fixtures:形状逐字取自 zed-industries/delta-claude hooks/setup/project-policy.ts
-// (readProjectPolicy 的合法输入/serializeProjectPolicy 的写出产物;org 存 team.id 即 org id)。
-// 兼容目标:delta-claude 写的文件 omp 能读,omp 写的文件 delta-claude 能读。
+// live-format fixtures: shapes taken verbatim from zed-industries/delta-claude hooks/setup/project-policy.ts
+// (legal inputs to readProjectPolicy / write output of serializeProjectPolicy; the org stores team.id, i.e. the org id).
+// Compatibility goal: files written by delta-claude are readable by omp, and files written by omp are readable by delta-claude.
 const FIXTURE_PRIVATE = `{
   "threads": {
     "mode": "private",
@@ -38,7 +38,7 @@ const FIXTURE_MANUAL_WITH_ORG = `{
 
 const ORG = { id: "org_01J8ZQ4V7M3X", name: "Acme Corp" };
 
-/** 模拟 ctx.ui.select:记录每次调用的参数,reply 用所选 label 或 undefined(Esc),抛错则模拟宿主异常。 */
+/** Fakes ctx.ui.select: records every call's arguments; reply returns the chosen label or undefined (Esc); throwing simulates a host error. */
 function fakeSelect(reply: (title: string, options: Array<{ label: string; description?: string }>) => string | undefined) {
 	const calls: Array<{ title: string; options: Array<{ label: string; description?: string }> }> = [];
 	const select = async (title: string, options: Array<{ label: string; description?: string }>) => {
@@ -287,7 +287,7 @@ describe("pickSetupMode (#21, ui.select seam)", () => {
 	it("non-interactive (missing ui.select) falls back to manual with a notify reason", async () => {
 		for (const ui of [undefined, {}, { ui: {} }, { select: "not a function" }]) {
 			const r = await pickSetupMode(ui, ORG);
-			assert.equal(r.mode, "manual"); // 回落现状,绝不静默开启自动同步
+			                    assert.equal(r.mode, "manual"); // fall back to the current behavior; never silently enable auto-sync
 			assert.match(r.fallback ?? "", /manual/);
 			assert.match(r.fallback ?? "", /delta-setup private/);
 		}
@@ -305,7 +305,7 @@ describe("pickSetupMode (#21, ui.select seam)", () => {
 	it("null org renders a generic organization label", async () => {
 		const ui = fakeSelect((_t, options) => options[1].label);
 		const r = await pickSetupMode(ui as any, null);
-		assert.match(ui.calls[0].options[1].label, /当前组织/);
+		            assert.match(ui.calls[0].options[1].label, /current org/);
 		assert.equal(r.mode, "organization");
 	});
 });
@@ -314,7 +314,7 @@ describe("renderProjectPolicy (#21 /delta-status line)", () => {
 	it("unconfigured policy states the manual default and hints at /delta-setup", () => {
 		const s = renderProjectPolicy({ mode: "manual", configured: false });
 		assert.match(s, /manual/);
-		assert.match(s, /未配置/);
+		            assert.match(s, /unconfigured/);
 		assert.match(s, /delta-setup/);
 	});
 
@@ -330,8 +330,8 @@ describe("renderProjectPolicy (#21 /delta-status line)", () => {
 	});
 
 	it("problem policy surfaces the problem text", () => {
-		const s = renderProjectPolicy({ mode: "manual", configured: false, problem: "不是有效 JSON(x)" });
-		assert.match(s, /无法使用/);
-		assert.match(s, /不是有效 JSON/);
+		        const s = renderProjectPolicy({ mode: "manual", configured: false, problem: "Not valid JSON (x)" });
+		        assert.match(s, /unusable/);
+		        assert.match(s, /Not valid JSON/);
 	});
 });

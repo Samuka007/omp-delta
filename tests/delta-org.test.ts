@@ -7,7 +7,7 @@ import {
 	parseOrgListFromText,
 } from "../omp-delta.ts";
 
-// 形状实采自本机 `delta --json org list` / `delta --json org current`(Windows,delta 0.23.0)
+// Shapes captured live from local `delta --json org list` / `delta --json org current` (Windows, delta 0.23.0)
 const LIVE_LIST = {
 	operation: "listed",
 	organizations: [
@@ -88,11 +88,11 @@ describe("formatOrgList", () => {
 		const lines = text.split("\n");
 		assert.equal(lines.length, 2);
 		assert.equal(lines[0], "  Samuka007's Organization (org_01km17je98bvcpaca0d07axwdq)");
-		assert.equal(lines[1], "* ALLE AI (org_01m68bjf0g8a2snb0p47zj9xrs) ← 当前:共享将使用此组织");
+		            assert.equal(lines[1], "* ALLE AI (org_01m68bjf0g8a2snb0p47zj9xrs) ← current: sharing will use this org");
 	});
 
 	it("renders a friendly line for an empty org list", () => {
-		assert.equal(formatOrgList([]), "未加入任何组织。");
+		            assert.equal(formatOrgList([]), "Not a member of any org.");
 	});
 
 	it("marks nothing when no org carries current:true", () => {

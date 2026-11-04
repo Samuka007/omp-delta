@@ -1,26 +1,26 @@
 /**
- * omp-delta — 把当前 omp 会话实时记录进一条 Delta 线程(经 Delta CLI,合约 v8)。
+ * omp-delta — Records the current omp session live into a Delta thread (via the Delta CLI, contract v8).
  *
- * 实现官方插件合约中属于插件一侧的四件事(delta.dev/docs/cli/build-a-plugin):
- *   1. 把 omp 活动翻译成 Delta 记录并推送(thread append,ACP v2 update)
- *   2. 记录只进内存队列,由服务端 next_sequence 对齐游标;已确认即出队;重发安全(返回 duplicate)
- *   3. thread watch 把队友评论回流进 omp 上下文(follow-up,不自动触发 turn)
- *   4. 线程被他人接管时(superseded / fenced)停止本地 turn
+ * Implements the plugin-side halves of the official plugin contract (delta.dev/docs/cli/build-a-plugin):
+ *   1. Translates omp activity into Delta records and pushes them (thread append, ACP v2 update)
+ *   2. Records go into an in-memory queue, aligned to the server's next_sequence cursor; acked records leave the queue; re-sending is safe (server returns duplicate)
+ *   3. thread watch flows teammate comments back into omp context (follow-ups, never auto-triggering a turn)
+ *   4. When the thread is taken over by someone else (superseded / fenced), stops the local turn
  *
- * MVP 范围:
- *   - 只记录主会话(ctx.agent.kind === "main");子代理 → Delta 子线程留待下一步
- *   - 首次连接从当下开始记录,不回导历史会话
- *   - 命令:/delta(路由)与平铺别名 /delta-share /delta-status /delta-detach /delta-retry /delta-org(只读) /delta-update
- *     /delta-setup(#21):仓库级同步策略 .delta/settings.json(兼容 delta-claude),private/organization 自动连接新会话
+ * MVP scope:
+ *   - Records the main session only (ctx.agent.kind === "main"); subagents → Delta child threads is a later step
+ *   - First connect records from now on; no history backfill
+ *   - Commands: /delta (router) plus flat aliases /delta-share /delta-status /delta-detach /delta-retry /delta-org (read-only) /delta-update
+ *     /delta-setup (#21): repo-level sync policy in .delta/settings.json (delta-claude compatible); private/organization auto-connect new sessions
  *
- * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
- * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
- * 模块层只保留无状态的 Delta CLI 进程封装与可单测的纯函数接缝。
- * 零本地状态(#10):线程身份以 DeltaDB 为权威,绑定关系写在 omp 会话记录里
- * (appendEntry 自定义条目),送达游标以服务端 next_sequence 为权威。
+ * Architecture note: omp rebinds the extension factory for every session (subagents included), but module variables are shared across sessions.
+ * All mutable state therefore lives in the Runtime created inside the factory closure (one per session, no cross-talk);
+ * the module layer keeps only the stateless Delta CLI process wrapper and unit-testable pure-function seams.
+ * Zero local state (#10): thread identity is authoritative in DeltaDB, the binding is written into the omp session record
+ * (appendEntry custom entry), and the delivery cursor is authoritative from the server's next_sequence.
  *
- * 安装:omp plugin install 'github:Samuka007/omp-delta'(或本地开发 omp plugin link ./),重启 omp;
- * Windows 上 installer 静默失败时,在 ~/.omp/plugins 里 npm install 'github:Samuka007/omp-delta' 等价(见 README)。
+ * Install: omp plugin install 'github:Samuka007/omp-delta' (or omp plugin link ./ for local development), then restart omp;
+ * on Windows, if the installer fails silently, npm install 'github:Samuka007/omp-delta' inside ~/.omp/plugins is equivalent (see README).
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -28,21 +28,21 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 
-const SOURCE = "omp"; // Delta 侧插件固定标识(--source)
-const PRODUCER = "omp"; // 线程内显示的生产者名(--producer-name)
-const CONTRACT_MIN = 8; // 本插件实现的合约版本
+const SOURCE = "omp"; // fixed plugin identifier on the Delta side (--source)
+const PRODUCER = "omp"; // producer name shown inside the thread (--producer-name)
+const CONTRACT_MIN = 8; // contract version implemented by this plugin
 const CONTRACT_MAX = 8;
 const SCHEMA_VERSION = 1;
 const APPEND_TIMEOUT_MS = 30_000;
-const UPDATE_TIMEOUT_MS = 300_000; // delta update 下载+安装远慢于 append:5 分钟预算
+const UPDATE_TIMEOUT_MS = 300_000; // delta update download+install is far slower than append: 5-minute budget
 const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
-const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible 供给窗口期:30s × 60 ≈ 30 分钟(实测可超 10 分钟)
-const MARKER_TYPE = "omp-delta.attachment"; // 写入 omp 会话的绑定标记(appendEntry,不进 LLM 上下文)
-// /delta-update:omp 没有 marketplace 自动更新,插件过期只能手动重装(#20)。
-// 无可靠"插件已过期"程序化信号时,这条命令是重装指引的唯一保证(见 renderUpdateReport)。
+const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible provisioning window: 30s × 60 ≈ 30 minutes (observed to exceed 10 minutes)
+const MARKER_TYPE = "omp-delta.attachment"; // binding marker written into the omp session (appendEntry, never enters LLM context)
+// /delta-update: omp has no marketplace auto-update; an outdated plugin can only be reinstalled manually (#20).
+// Without a reliable programmatic "plugin outdated" signal, this command is the only guaranteed reinstall hint (see renderUpdateReport).
 export const PLUGIN_REINSTALL_CMD = "omp plugin install 'github:Samuka007/omp-delta'";
-// 供给窗口期签名:append 错误分类与连接重试共用一套,保持同步
+// Provisioning-window signatures: shared by append error classification and connect retries, kept in sync
 const NOT_VISIBLE_RE = /not_visible|history is unavailable/i;
 const PROVISIONING_RE = /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i;
 
@@ -52,46 +52,46 @@ type DeltaRecord = {
 	update: Record<string, unknown>;
 };
 
-/** 每个omp会话一份的运行时状态(工厂闭包持有,互不共享;一切身份/游标均为内存态)。
- *  权威:线程身份与送达游标在 DeltaDB,绑定关系在 omp session JSONL(MARKER_TYPE)。 */
+/** Runtime state, one instance per omp session (held by the factory closure, never shared; all identity/cursor state is in-memory).
+ *  Authority: thread identity and delivery cursor live in DeltaDB; the binding lives in the omp session JSONL (MARKER_TYPE). */
 type Runtime = {
 	pi: any;
 	cwd: string;
 	sid: string;
 	isSub: boolean;
 	connected: boolean;
-	// 线程身份(内存态)
+	// Thread identity (in-memory)
 	threadId: string | null;
 	worktreeRef: string | null;
 	visibility: "private" | "organization" | null;
 	url: string | null;
 	titleSent: boolean;
-	// 送达游标(内存态;next_sequence 对齐后 seqReady 才放行 emit)
+	// Delivery cursor (in-memory; emit is gated on seqReady once aligned to next_sequence)
 	seq: number;
 	lastAcked: number;
 	pending: DeltaRecord[];
 	seqReady: boolean;
-	currentTurn: number | null; // running 记录的 seq;turn 内所有记录共用
+	currentTurn: number | null; // seq of the running record; shared by every record inside the turn
 	paused: boolean;
-	expectingIdentity: boolean; // 重连在途:事件照常入临时队列,游标到达后重编号
+	expectingIdentity: boolean; // reconnect in flight: events keep queueing temporarily, renumbered once the cursor arrives
 	retryAttempts: number;
 	historyWaitAttempts: number;
 	connectAttempts: number;
-	eventCtx: any; // session_start 的事件 ctx:持有托管 setTimeout
+	eventCtx: any; // event ctx from session_start: holds the managed setTimeout
 	detaching: boolean;
-	detached: boolean; // 用户显式 detach(#18):指示清槽;重连成功才恢复(与断线 offline 区分)
+	detached: boolean; // explicit user detach (#18): indicator clears its slot; restored only after a successful reconnect (distinct from disconnect offline)
 	mountChild: ChildProcess | null;
 	watchChild: ChildProcess | null;
 };
 
-// ---- 无状态 Delta CLI 进程封装(模块级) ----
+// ---- Stateless Delta CLI process wrapper (module level) ----
 
 let deltaBin: string | null = null;
 let envDumped = false;
-let statusSurfaceWarned = false; // #18:状态槽位缺失只提醒一次(模块变量跨会话共享 → 每进程一次)
+let statusSurfaceWarned = false; // #18: warn about a missing status slot only once (module variables are shared across sessions → once per process)
 
-/** #11 诊断:delta 在 omp 内 spawn 时报 NotFound、外部终端同命令秒通。
- *  仅在 OMP_DELTA_DEBUG=1 时,首次 spawn 把解析到的二进制与关键 env 写进 omp 日志,定位环境差异。 */
+/** #11 diagnostics: delta reports NotFound when spawned inside omp, while the same command works instantly in an external terminal.
+ *  Only when OMP_DELTA_DEBUG=1: on first spawn, dump the resolved binary and key env vars into the omp log to pinpoint the environment difference. */
 function dumpSpawnEnvOnce() {
 		if (envDumped) return;
 		if (process.env.OMP_DELTA_DEBUG !== "1") return;
@@ -103,22 +103,22 @@ function dumpSpawnEnvOnce() {
 	try {
 		console.error("[omp-delta] spawn env snapshot: binary=" + (deltaBin ?? "<unresolved>") + " ; " + snap);
 	} catch {
-		/* console 不可用则跳过 */
+		/* skip if console is unavailable */
 	}
 }
 
-// Discovery 顺序对齐参考插件(zed-industries/delta-claude hooks/cli/cli.ts):
-// PATH 优先,再按平台尝试安装器的 App Bundle 位置(Linux 默认 ~/.local/delta.app/bin/delta)。
-// 不提供 DELTA_BIN 之类的环境变量覆盖,与参考插件保持一致。
+// Discovery order matches the reference plugin (zed-industries/delta-claude hooks/cli/cli.ts):
+// PATH first, then installer App Bundle locations per platform (Linux default ~/.local/delta.app/bin/delta).
+// No DELTA_BIN-style env override, staying consistent with the reference plugin.
 function resolveDelta(): string {
 	if (deltaBin) return deltaBin;
 	const home = process.env.HOME ?? "";
 	const lc = process.env.LOCALAPPDATA ?? "";
 	const candidates = [
 		"delta",
-		home ? path.join(home, ".local", "delta.app", "bin", "delta") : "", // Linux: install.sh 默认位置
+		home ? path.join(home, ".local", "delta.app", "bin", "delta") : "", // Linux: install.sh default location
 		home ? path.join(home, "Applications", "Delta.app", "Contents", "MacOS", "delta") : "",
-		"/Applications/Delta.app/Contents/MacOS/delta", // macOS: App Bundle 内置 CLI,未装 PATH 时
+		"/Applications/Delta.app/Contents/MacOS/delta", // macOS: CLI bundled in the App Bundle, for when it's not on PATH
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta.exe") : "",
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta") : "",
 	].filter(Boolean);
@@ -128,14 +128,14 @@ function resolveDelta(): string {
 		return c;
 	}
 	throw new Error(
-		"找不到 delta CLI(PATH 中的 delta 若是同名 git pager 会被跳过)。" +
-			"请安装 Delta(curl -fsSL https://delta.dev/install.sh | sh)后重启 omp",
+		"delta CLI not found (a delta on PATH that is the same-named git pager is skipped)." +
+			"Install Delta (curl -fsSL https://delta.dev/install.sh | sh) and restart omp",
 	);
 }
 
-// `delta --version` 无法区分 Delta CLI 与同名的 git pager(两者都输出 "delta X.Y.Z"),
-// 参考插件直接信任 command -v 的结果,但 NixOS 等发行版的 PATH 里 delta 是 git pager,
-// 所以这里用 `--help` 检查子命令列表(Delta CLI 独有 org/thread/worktree 等)才算命中。
+// `delta --version` cannot tell the Delta CLI apart from the same-named git pager (both print "delta X.Y.Z").
+// The reference plugin trusts command -v directly, but on distros like NixOS the delta on PATH is the git pager,
+// so instead check the subcommand list via `--help` (org/thread/worktree etc. are unique to the Delta CLI).
 function isDeltaCli(bin: string): boolean {
 	try {
 		const r = spawnSync(bin, ["--help"], { windowsHide: true, timeout: 10_000 });
@@ -170,23 +170,23 @@ function runDelta(
 			done = true;
 			clearTimeout(timer);
 			clearTimeout(hardKill);
-			dumpSpawnEnvOnce(); // 首次调用即记录:对比 omp 内/外 delta 的运行环境(#11)
+			dumpSpawnEnvOnce(); // record on first call: compare delta's environment inside vs. outside omp (#11)
 			resolve({ code, out, err });
 		};
 		const timer = setTimeout(() => {
 			try {
 				child.kill();
 			} catch {
-				/* 已退出 */
+				/* already exited */
 			}
 		}, opts?.timeoutMs ?? APPEND_TIMEOUT_MS);
-		// Windows 上 SIGTERM 后孙进程可能仍握住 stdio 管道,close 事件永不触发:
-		// 兜底二次强杀,并以 exit 事件(进程死亡即发)解析,不依赖 close。
+		// On Windows, after SIGTERM a grandchild process may still hold the stdio pipes and the close event never fires:
+		// fall back to a second hard kill, and parse from the exit event (fires on process death) instead of close.
 		const hardKill = setTimeout(() => {
 			try {
 				child.kill("SIGKILL");
 			} catch {
-				/* 已退出 */
+				/* already exited */
 			}
 		}, (opts?.timeoutMs ?? APPEND_TIMEOUT_MS) + 1_000);
 		child.stdout?.on("data", (d) => {
@@ -207,14 +207,15 @@ function runDelta(
 
 export function parseJsonLines(text: string): any[] {
 	const t = text.trim();
-	// 以 [ / { 开头的输出优先整体解析:pretty-printed JSON(如 thread list)的行里
-	// 恰好整行都是字符串字面量时,逐行解析会得到一堆垃圾字符串,
-	// 导致"看起来解析成功"而永远不走兜底 —— 必须先试整体。JSONL 多值流整体解析失败,自然落到逐行。
+	// Output starting with [ / { is parsed as a whole first: with pretty-printed JSON (e.g. thread list),
+	// lines can happen to be entire string literals, so line-by-line parsing yields a pile of garbage strings
+	// that "looks like a successful parse" and never reaches the fallback — the whole-body attempt must come first.
+	// Multi-value JSONL streams fail the whole-body parse and naturally fall through to line-by-line.
 	if (t.startsWith("[") || t.startsWith("{")) {
 		try {
 			return [JSON.parse(t)];
 		} catch {
-			/* 多值 JSONL 流:落回逐行 */
+			/* multi-value JSONL stream: fall through to line-by-line */
 		}
 	}
 	const result: any[] = [];
@@ -224,7 +225,7 @@ export function parseJsonLines(text: string): any[] {
 		try {
 			result.push(JSON.parse(line2));
 		} catch {
-			/* 非 JSON 行,忽略 */
+			/* non-JSON line, ignored */
 		}
 	}
 	return result;
@@ -235,11 +236,11 @@ async function runDeltaJson(args: string[], opts?: { input?: string; timeoutMs?:
 	try {
 		return runDeltaJsonFromText(r.out, r.err);
 	} catch {
-		throw new Error("delta " + args.join(" ") + " 无 JSON 输出: " + (r.err || r.out).slice(0, 400));
+		throw new Error("delta " + args.join(" ") + " produced no JSON output: " + (r.err || r.out).slice(0, 400));
 	}
 }
 
-/** 已有原始输出时的 JSON 解析(JSONL 优先,整体 JSON 兜底)。 */
+/** JSON parsing when raw output is already available (JSONL first, whole-body JSON fallback). */
 function runDeltaJsonFromText(out: string, err: string): any {
 	const js = parseJsonLines(out).concat(parseJsonLines(err));
 	if (js.length === 0) {
@@ -248,42 +249,42 @@ function runDeltaJsonFromText(out: string, err: string): any {
 	return js[js.length - 1];
 }
 
-/** delta CLI 未登录时的统一可操作提示(#19:干净错误,不带堆栈)。
- *  实测签名来自 delta.exe 内嵌错误串:not signed in / authentication required。 */
-const ORG_UNAUTH_HINT = "Delta CLI 未登录:请先运行 delta auth login(或在 Delta 应用内登录)后重试。";
+/** Uniform actionable hint for an unauthenticated delta CLI (#19: clean error, no stack).
+ *  Signatures observed from delta.exe's embedded error strings: not signed in / authentication required. */
+const ORG_UNAUTH_HINT = "Delta CLI is not signed in: run delta auth login (or sign in from the Delta app), then retry.";
 
-/** /delta-join 账号不匹配的统一可操作提示(#17)。
- *  实测签名:他人私有/不存在的分享 id → not_visible "shared thread is absent or not visible";
- *  不属于本账号的线程 id / 链接有误 → invalid_reference "…exact thread ID in this account"。
- *  刚创建的线程仍在供给期时是同一签名(not_visible),提示里带上这一点。 */
+/** Uniform actionable hint for a /delta-join account mismatch (#17).
+ *  Observed signatures: someone else's private/nonexistent share id → not_visible "shared thread is absent or not visible";
+ *  a thread id not owned by this account / a wrong link → invalid_reference "…exact thread ID in this account".
+ *  A thread still in its provisioning window right after creation shows the same signature (not_visible), so the hint mentions that. */
 const JOIN_MISMATCH_HINT =
-	"无法加入该线程:它对当前账号不可见 —— 通常因为线程属于其他账号(私有未共享给你)、链接或 ID 有误,或线程刚创建仍在供给中(可稍后重试)。";
+	"Cannot join this thread: it is not visible to the current account — usually because the thread belongs to another account (private, not shared with you), the link or ID is wrong, or the thread was just created and is still provisioning (retry shortly).";
 
-/** 当前选中的组织(创建线程时必须显式指定)。 */
+/** Currently selected org (must be given explicitly when creating a thread). */
 async function resolveOrg(): Promise<{ id: string; name: string }> {
 	const r = await runDelta(["org", "current"]);
 	const combined = r.out + "\n" + r.err;
 	if (isUnauthenticatedText(combined)) throw new Error(ORG_UNAUTH_HINT);
 	const org = parseOrgCurrentFromText(combined);
 	if (!org) {
-		throw new Error("未能解析当前组织(code " + r.code + "):请用 delta org switch 选择组织后重试。");
+		throw new Error("Could not parse the current org (code " + r.code + "): pick one with delta org switch and retry.");
 	}
 	return org;
 }
 
-// ---- /delta-share 可见性决策(纯接缝:ui 由调用方注入,测试可传 fake ctx.ui.select) ----
+// ---- /delta-share visibility decision (pure seam: ui is injected by the caller, tests can pass a fake ctx.ui.select) ----
 
-/** pickShareVisibility 的结果:mode null = 用户放弃选择器(取消连接);fallback 非空 = 非交互回落默认(文案交调用方 notify)。 */
+/** Result of pickShareVisibility: mode null = user dismissed the picker (cancel connect); fallback non-empty = non-interactive default with a message for the caller to notify. */
 export type VisibilityPick = {
 	mode: "private" | "organization" | null;
 	fallback: string | null;
 };
 
-/** /delta-share 可见性决策(#16):
- *  - 显式参数(priv* 前缀 = 私有,其余非空参数 = 组织)→ 直接采用,绝不触碰选择器(向后兼容);
- *  - 无参数 → ctx.ui.select 弹出 Private / Organization(带当前组织名)选择器,先于 consent confirm;
- *  - 非交互(select 缺失/抛错)→ 回落默认 organization 并带回 fallback 文案,绝不抛出;
- *  - 用户放弃选择器(Esc/undefined)→ mode null,调用方按取消处理。 */
+/** /delta-share visibility decision (#16):
+ *  - explicit argument (priv* prefix = private, any other non-empty argument = organization) → taken as-is, never touches the picker (backward compatible);
+ *  - no argument → ctx.ui.select offers Private / Organization (with the current org name) before the consent confirm;
+ *  - non-interactive (select missing/throws) → fall back to organization with a fallback message, never throws;
+ *  - user dismisses the picker (Esc/undefined) → mode null, caller treats it as a cancel. */
 export async function pickShareVisibility(
 	args: string | null | undefined,
 	ui: any,
@@ -291,49 +292,49 @@ export async function pickShareVisibility(
 ): Promise<VisibilityPick> {
 	const arg = String(args ?? "").trim().toLowerCase();
 	if (arg) {
-		// 旧行为:priv 前缀 → 私有,其余显式参数 → 组织
+		// Old behavior: priv prefix → private, any other explicit argument → organization
 		return { mode: arg.startsWith("priv") ? "private" : "organization", fallback: null };
 	}
 	const options = [
-		{ label: "Private(私有线程,仅自己可见)", description: "不共享给组织" },
-		{ label: "Organization(共享给 " + org.name + ")", description: "组织成员可见" },
+		{ label: "Private (private thread, visible only to you)", description: "Not shared with the org" },
+		{ label: "Organization (shared with " + org.name + ")", description: "Visible to org members" },
 	];
-	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>,返回所选 label
+	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>, resolves with the chosen label
 	if (typeof select !== "function") {
-		return { mode: "organization", fallback: "当前环境不支持交互选择,使用默认可见性:共享给组织 " + org.name };
+		return { mode: "organization", fallback: "Interactive selection is unavailable in this environment; using the default visibility: shared with org " + org.name };
 	}
 	let label: unknown;
 	try {
-		label = await select("选择 Delta 线程可见性", options);
+		label = await select("Choose Delta thread visibility", options);
 	} catch (e) {
 		return {
 			mode: "organization",
-			fallback: "可见性选择器不可用(" + String(e instanceof Error ? e.message : e) + "),使用默认:共享给组织 " + org.name,
+			fallback: "Visibility picker unavailable (" + String(e instanceof Error ? e.message : e) + "); using the default: shared with org " + org.name,
 		};
 	}
 	if (typeof label !== "string") {
-		return { mode: null, fallback: null }; // 用户放弃(Esc)
+		return { mode: null, fallback: null }; // user dismissed (Esc)
 	}
 	if (label === options[0].label) return { mode: "private", fallback: null };
-	// 第二项 / 无法识别的标签都归组织(与旧默认一致;confirm 会再次展示组织名供最终确认)
+	// The second option / an unrecognized label both count as organization (same as the old default; confirm shows the org name again for final consent)
 	return { mode: "organization", fallback: null };
 }
 
-// ---- 纯函数接缝(可直接单测;合约语义见 docs/contract-notes.md) ----
+// ---- Pure-function seams (directly unit-testable; contract semantics in docs/contract-notes.md) ----
 
-// ---- /delta 路由(#15):单一入口;平铺命令保持原样作为别名 ----
+// ---- /delta router (#15): single entry point; flat commands remain unchanged as aliases ----
 
-/** /delta 路由决策:menu = 无参数(用法菜单,不是错误);route = 已实现子命令(转发同一 handler);
- *  unknown = 未知子命令。 */
+/** /delta routing decision: menu = no arguments (usage menu, not an error); route = implemented subcommand (forwards to the same handler);
+ *  unknown = unknown subcommand. */
 export type DeltaRouteDecision =
 	| { kind: "menu" }
 	| { kind: "route"; command: "delta-share" | "delta-status" | "delta-detach" | "delta-retry" | "delta-join"; args: string }
 	| { kind: "unknown"; command: string };
 
-/** 解析 `/delta <子命令> [剩余参数]`(#15):大小写不敏感,空白折叠。
- *  子命令与平铺命令一一对应:share→delta-share、status→delta-status、detach→delta-detach、
- *  retry→delta-retry、join→delta-join(#17)。
- *  /delta-org、/delta-update 不在路由内(有独立拼写,菜单里指引)。 */
+/** Parses `/delta <subcommand> [rest]` (#15): case-insensitive, whitespace collapsed.
+ *  Subcommands map one-to-one onto the flat commands: share→delta-share, status→delta-status, detach→delta-detach,
+ *  retry→delta-retry, join→delta-join (#17).
+ *  /delta-org and /delta-update are not routed (they have their own spelling; the menu points at them). */
 export function parseDeltaRouter(args: string): DeltaRouteDecision {
 	const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
 	if (parts.length === 0) return { kind: "menu" };
@@ -351,22 +352,22 @@ export function parseDeltaRouter(args: string): DeltaRouteDecision {
 	return { kind: "route", command, args: rest };
 }
 
-/** /delta 无参数时的用法菜单(不是错误)。 */
+/** Usage menu for /delta with no arguments (not an error). */
 export function renderDeltaMenu(): string {
 	return [
-		"delta — omp-delta 命令路由:",
-		"  /delta share [private]   连接当前会话(= /delta-share)",
-		"  /delta join <link|id>    加入已有线程;--move 物化 checkout 并指引 /move(= /delta-join)",
-		"  /delta status            查看连接与同步状态(= /delta-status)",
-		"  /delta retry             恢复/重试推送(= /delta-retry)",
-		"  /delta detach            断开同步(= /delta-detach)",
-		"  其他命令:/delta-setup [private|organization|manual] · /delta-org list|current · /delta-update [check]",
-		"  平铺别名继续可用:/delta-share /delta-join /delta-status /delta-detach /delta-retry",
+		"delta — omp-delta command router:",
+		"  /delta share [private]   connect the current session (= /delta-share)",
+		"  /delta join <link|id>    join an existing thread; --move materializes the checkout and guides /move (= /delta-join)",
+		"  /delta status            show connection and sync status (= /delta-status)",
+		"  /delta retry             resume/retry pushing (= /delta-retry)",
+		"  /delta detach            disconnect sync (= /delta-detach)",
+		"  Other commands: /delta-setup [private|organization|manual] · /delta-org list|current · /delta-update [check]",
+		"  Flat aliases keep working: /delta-share /delta-join /delta-status /delta-detach /delta-retry",
 	].join("\n");
 }
 
-// ---- /delta-join(#17,#22):把当前会话挂上已有线程;默认 weak(挂当前 checkout),
-// ---- --move/--into 物化线程 checkout 到新目录并指引手动 /move(自动化待上游 oh-my-pi#17441)。
+// ---- /delta-join (#17,#22): attach the current session to an existing thread; weak by default (attach the current checkout);
+// ---- --move/--into materializes the thread's checkout into a new directory and guides a manual /move (automation pending upstream oh-my-pi#17441).
 
 export type JoinTarget =
 	| { kind: "link"; shareId: string; raw: string }
@@ -375,18 +376,18 @@ export type JoinTarget =
 	| { kind: "invalid"; raw: string }
 	| { kind: "empty" };
 
-// 实测形态(delta 0.23.0):join 链接 https://delta.dev/join/<share-id> 或 delta://join/<share-id>;
-// share id 形如 thread_01m6jt5nyc4znwdfcg9p2mk49d(与 thread id 无派生关系,见 contract-notes);
-// 线程 id 是不透明长 token(含字母/数字/-/_)。链接尾部允许一个 /;query/hash 一律算 invalid(粘贴噪音应自己清掉)。
+// Observed shapes (delta 0.23.0): join link https://delta.dev/join/<share-id> or delta://join/<share-id>;
+// share ids look like thread_01m6jt5nyc4znwdfcg9p2mk49d (no derivation to/from the thread id, see contract-notes);
+// thread ids are opaque long tokens (letters/digits/-/_). One trailing / on a link is allowed; query/hash is always invalid (paste noise should be cleaned up by the user).
 const JOIN_LINK_RE = /^(?:https:\/\/delta\.dev\/join\/|delta:\/\/join\/)([A-Za-z0-9][A-Za-z0-9_-]*)\/?$/i;
 const JOIN_SHARE_ID_RE = /^thread_[A-Za-z0-9_-]+$/;
 const JOIN_PLAUSIBLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
-/** 解析 /delta-join 参数(#17):delta.dev join 链接(https 或 delta://)、thread_ 分享 id、
- *  或裸线程 id。链接形态提取 shareId 供展示;三种可解析形态的原文都交给
- *  `delta thread status <raw>` —— CLI 侧统一解析(实测三种形态全部直达同一线程)。
- *  empty = 没给参数;invalid = 含空白/路径分隔符/query 等不可能成为 id 的输入,
- *  在本地直接报错,不劳 CLI。 */
+/** Parses /delta-join arguments (#17): a delta.dev join link (https or delta://), a thread_ share id,
+ *  or a bare thread id. Link forms have their shareId extracted for display; the raw text of all three resolvable
+ *  forms is passed to `delta thread status <raw>` — the CLI resolves them uniformly (all three reach the same thread, as observed).
+ *  empty = no argument given; invalid = input that cannot be an id (whitespace/path separators/query etc.),
+ *  rejected locally without bothering the CLI. */
 export function parseJoinTarget(args: string | null | undefined): JoinTarget {
 	const raw = String(args ?? "").trim();
 	if (!raw) return { kind: "empty" };
@@ -399,13 +400,13 @@ export function parseJoinTarget(args: string | null | undefined): JoinTarget {
 
 export type JoinFailureKind = "unauthenticated" | "account-mismatch" | "unknown";
 
-/** parseJoinTarget 中可直接交给 CLI 解析的三种形态(link/share-id/thread-id);
- *  empty/invalid 在本地拦截,永不进入 joinShared。 */
+/** The three parseJoinTarget forms that can go straight to the CLI (link/share-id/thread-id);
+ *  empty/invalid are intercepted locally and never reach joinShared. */
 export type ResolvableJoinTarget = Extract<JoinTarget, { kind: "link" | "share-id" | "thread-id" }>;
 
-/** /delta-join 调用参数(#22):目标 + 物化选项。--into 隐含 --move;
- *  into === "" 表示给了 --into 但没给值(usage 错误);未知旗标留在 target 里由
- *  parseJoinTarget 判为 invalid(“-”开头不是合法 id)。 */
+/** /delta-join invocation arguments (#22): target + materialization options. --into implies --move;
+ *  into === "" means --into was given without a value (usage error); unknown flags stay inside target and
+ *  are judged invalid by parseJoinTarget (a leading "-" is not a legal id). */
 export type JoinInvocation = { target: JoinTarget; move: boolean; into: string | null };
 
 export function parseJoinInvocation(args: string | null | undefined): JoinInvocation {
@@ -434,11 +435,11 @@ export type MaterializePick =
 	| { kind: "ambiguous"; refs: string[] }
 	| { kind: "empty" };
 
-/** 线程 checkout 在本机的存在性判定(#22):任一 worktree 条目的任一 checkout 目录
- *  在本机存在 → local(cwdMatch = 当前目录就是其中之一);全部条目都不在本机 →
- *  恰好一个 foreign 条目时给出可物化的 ref,多个报 ambiguous(不知道该物化谁的),
- *  线程没有任何 worktree 条目 → empty(无可物化)。local 也带 ref:显式 --move 时
- *  允许把本机已有 ref 再物化一份新目录。exists 注入以便单测(默认 fs.existsSync)。 */
+/** Whether the thread's checkout exists on this machine (#22): if any checkout directory of any worktree entry
+ *  exists locally → local (cwdMatch = the current directory is one of them); if no entry exists locally →
+ *  exactly one foreign entry yields a materializable ref, several are ambiguous (unknown which to materialize),
+ *  a thread with no worktree entries → empty (nothing to materialize). local still carries ref: an explicit --move
+ *  may materialize an already-local ref into a fresh directory. exists is injected for unit tests (default fs.existsSync). */
 export function pickMaterializeCandidate(
 	items: any[],
 	cwd: string,
@@ -467,8 +468,8 @@ export function pickMaterializeCandidate(
 	return { kind: "empty" };
 }
 
-/** 物化目标目录的默认推导(#22):当前目录的同级,sanitized(thread 标题或 share id)
- *  前缀 delta-;仅在调用方没给 --into 时使用。纯路径运算,不做 fs 检查。 */
+/** Default derivation of the materialization target directory (#22): a sibling of the current directory, prefixed with a
+ *  sanitized (thread title or share id) and "delta-"; used only when the caller gave no --into. Pure path math, no fs checks. */
 export function deriveMaterializeDir(cwd: string, seed: string): string {
 	const clean = String(seed ?? "")
 		.replace(/[^A-Za-z0-9._-]+/g, "-")
@@ -479,27 +480,27 @@ export function deriveMaterializeDir(cwd: string, seed: string): string {
 	return path.join(path.dirname(String(cwd ?? "")), name);
 }
 
-/** join 失败分类(#17):账号不匹配的干净错误优先(验收标准)。
- *  classifyJoinFailure 只在 thread status 非零退出时调用;能到这里还能命中
- *  invalid_reference/not_visible 的,都是“存在性/可见性”层面的拒绝 —— 语法层面的
- *  垃圾输入已被 parseJoinTarget 的 invalid 拦在本地。 */
+/** join failure classification (#17): the clean account-mismatch error comes first (acceptance criterion).
+ *  classifyJoinFailure runs only when thread status exits non-zero; anything still matching
+ *  invalid_reference/not_visible here is an "existence/visibility" rejection — syntactically
+ *  garbage input has already been rejected locally by parseJoinTarget's invalid. */
 export function classifyJoinFailure(text: string): JoinFailureKind {
 	if (isUnauthenticatedText(text)) return "unauthenticated";
 	if (/not_visible|shared thread is absent|not in this account|invalid_reference/i.test(text)) return "account-mismatch";
 	return "unknown";
 }
 
-/** 未登录判定:对 delta 的 stdout+stderr 原文做签名匹配(不区分 JSON/纯文本)。 */
+/** Unauthenticated detection: signature matching against delta's raw stdout+stderr (JSON vs. plain text agnostic). */
 export function isUnauthenticatedText(text: string): boolean {
 	return /not signed in|not logged in|unauthenticated|authentication required|please (?:log|sign) in|unauthorized/i.test(text);
 }
 
 export type OrgInfo = { id: string; name: string; current: boolean };
 
-/** 解析 `delta org list --json` 输出:{"operation":"listed","organizations":[{id,name,current}]}
- *  (顺序即 CLI pretty 展示顺序,current:true 恰好一个)。parseJsonLines 统一入口,
- *  pretty-printed 整体 JSON 与逐行 JSONL 都能吃;顶层裸数组也接受。
- *  返回 null = 没有任何组织载荷(失败/未登录);[] = 已登录但未加入任何组织。 */
+/** Parses `delta org list --json` output: {"operation":"listed","organizations":[{id,name,current}]}
+ *  (order equals the CLI's pretty display order; exactly one current:true). parseJsonLines is the single entry,
+ *  accepting both pretty-printed whole-body JSON and line-by-line JSONL; a top-level bare array is accepted too.
+ *  Returns null = no org payload at all (failure/unauthenticated); [] = signed in but joined no orgs. */
 export function parseOrgListFromText(text: string): OrgInfo[] | null {
 	for (const js of parseJsonLines(text)) {
 		const arr = Array.isArray(js?.organizations) ? js.organizations : Array.isArray(js) ? js : null;
@@ -511,7 +512,7 @@ export function parseOrgListFromText(text: string): OrgInfo[] | null {
 	return null;
 }
 
-/** 解析 `delta org current --json` 输出:{"operation":"current","organization":{id,name,current}}。 */
+/** Parses `delta org current --json` output: {"operation":"current","organization":{id,name,current}}. */
 export function parseOrgCurrentFromText(text: string): { id: string; name: string } | null {
 	for (const js of parseJsonLines(text)) {
 		const id = String(js?.organization?.id ?? "");
@@ -520,33 +521,33 @@ export function parseOrgCurrentFromText(text: string): { id: string; name: strin
 	return null;
 }
 
-/** /delta-org list 渲染:沿用 CLI 自身 pretty 约定(行首 `*` 标记当前组织)。 */
+/** /delta-org list rendering: follows the CLI's own pretty convention (a leading `*` marks the current org). */
 export function formatOrgList(orgs: OrgInfo[]): string {
-	if (orgs.length === 0) return "未加入任何组织。";
+	if (orgs.length === 0) return "Not a member of any org.";
 	return orgs
-		.map((o) => (o.current ? "* " : "  ") + o.name + " (" + o.id + ")" + (o.current ? " ← 当前:共享将使用此组织" : ""))
+		.map((o) => (o.current ? "* " : "  ") + o.name + " (" + o.id + ")" + (o.current ? " ← current: sharing will use this org" : ""))
 		.join("\n");
 }
 
-// ---- /delta-setup 仓库同步策略(#21):.delta/settings.json,格式兼容 zed-industries/delta-claude ----
-// 格式权威:delta-claude hooks/setup/project-policy.ts(细节记录在 docs/contract-notes.md「Repo policy」)。
-// 形状:{"threads":{"mode":"manual|private|organization","organization":"<org id>"}};
-// private/organization 要求非空 organization(delta-claude 存 team.id,这里存 delta org list 的 id);
-// manual 可带 organization(delta-claude 语义:/delta share 的共享目标,omp 暂不消费);其余键原样保留。
-// 注意:仓库里的 .delta/ 目录是 Delta 自己的 worktree 簿记,与这份策略文件无关,忽略规则只认 settings.json 这一个路径。
+// ---- /delta-setup repo sync policy (#21): .delta/settings.json, format-compatible with zed-industries/delta-claude ----
+// Format authority: delta-claude hooks/setup/project-policy.ts (details recorded in docs/contract-notes.md "Repo policy").
+// Shape: {"threads":{"mode":"manual|private|organization","organization":"<org id>"}};
+// private/organization require a non-empty organization (delta-claude stores team.id; we store the id from delta org list);
+// manual may carry organization (delta-claude semantics: the /delta share target, not consumed by omp yet); other keys are kept as-is.
+// Note: the repo's .delta/ directory is Delta's own worktree bookkeeping, unrelated to this policy file; the exclude rule recognizes only the settings.json path.
 
-/** 仓库的同步模式(缺文件/未配置 = manual,现状行为:仅显式 /delta-share)。 */
+/** The repo's sync mode (missing file/unconfigured = manual, current behavior: explicit /delta-share only). */
 export type ThreadMode = "manual" | "private" | "organization";
 
-/** 校验后的有效策略。problem 非空 = 文件存在但用不了(manual 兜底,提示只出一次)。 */
+/** Validated effective policy. Non-empty problem = the file exists but is unusable (manual fallback; the notice shows once). */
 export type ProjectPolicy = {
 	mode: ThreadMode;
 	organization?: string;
-	configured: boolean; // 文件刻意配置了策略;缺文件/缺 threads/缺 mode 都算未配置
-	problem?: string; // 文件无法使用的原因(session_start 一次性提示,/delta-status 常驻展示)
+	configured: boolean; // the file deliberately configured a policy; missing file/threads/mode all count as unconfigured
+	problem?: string; // why the file is unusable (one-time notice at session_start; always shown by /delta-status)
 };
 
-/** 策略文件读取结果:policy = 有效策略;document = 原始文档(重写时未知键不丢);malformed = 解析失败。 */
+/** Policy file read result: policy = effective policy; document = raw document (unknown keys survive rewrites); malformed = parse failed. */
 export type PolicyFile = {
 	policy: ProjectPolicy;
 	document?: Record<string, unknown>;
@@ -559,45 +560,45 @@ function isJsonObject(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** 解析并校验策略文本(缺文件传 undefined)。语义与 delta-claude readProjectPolicy 对齐:
- *  缺文件/缺 threads/缺 mode → 未配置 manual(无 problem);malformed JSON/非对象/非法 mode/
- *  自动模式缺 organization → manual 兜底 + problem。 */
+/** Parses and validates policy text (pass undefined when the file is missing). Semantics aligned with delta-claude readProjectPolicy:
+ *  missing file/threads/mode → unconfigured manual (no problem); malformed JSON/non-object/illegal mode/
+ *  auto mode missing organization → manual fallback + problem. */
 export function readProjectPolicy(text: string | undefined): PolicyFile {
 	if (text === undefined) return { policy: { mode: "manual", configured: false } };
 	let document: unknown;
 	try {
 		document = JSON.parse(text);
 	} catch (e) {
-		return { malformed: true, policy: { mode: "manual", configured: false, problem: "不是有效 JSON(" + String(e instanceof Error ? e.message : e) + ")" } };
+		return { malformed: true, policy: { mode: "manual", configured: false, problem: "Not valid JSON (" + String(e instanceof Error ? e.message : e) + ")" } };
 	}
 	if (!isJsonObject(document)) {
-		return { malformed: true, policy: { mode: "manual", configured: false, problem: "内容不是 JSON 对象" } };
+		return { malformed: true, policy: { mode: "manual", configured: false, problem: "Content is not a JSON object" } };
 	}
 	const threads = document.threads;
 	if (threads === undefined) return { document, policy: { mode: "manual", configured: false } };
 	if (!isJsonObject(threads)) {
-		return { document, policy: { mode: "manual", configured: false, problem: "threads 的值不是对象" } };
+		return { document, policy: { mode: "manual", configured: false, problem: "threads value is not an object" } };
 	}
 	const mode = threads.mode;
 	if (mode === undefined) return { document, policy: { mode: "manual", configured: false } };
 	if (typeof mode !== "string" || !POLICY_MODES.includes(mode as ThreadMode)) {
-		return { document, policy: { mode: "manual", configured: false, problem: "mode 必须是 " + POLICY_MODES.join(" / ") + " 之一" } };
+		return { document, policy: { mode: "manual", configured: false, problem: "mode must be one of " + POLICY_MODES.join(" / ") } };
 	}
 	const organization = threads.organization;
 	if (mode === "manual") {
-		// manual 允许带 organization(delta-claude 语义:/delta share 的共享目标)
+		// manual may carry organization (delta-claude semantics: the /delta share target)
 		const policy: ProjectPolicy = { mode: "manual", configured: true };
 		if (typeof organization === "string" && organization.trim()) policy.organization = organization;
 		return { document, policy };
 	}
 	if (typeof organization !== "string" || !organization.trim()) {
-		return { document, policy: { mode: "manual", configured: false, problem: 'mode "' + mode + '" 需要非空 organization' } };
+		return { document, policy: { mode: "manual", configured: false, problem: 'mode "' + mode + '" requires a non-empty organization' } };
 	}
 	return { document, policy: { mode: mode as ThreadMode, organization, configured: true } };
 }
 
-/** 序列化策略:保留上一文档全部未知键(顶层与 threads 内),2 空格缩进 + 末尾换行(同 delta-claude)。
- *  organization === undefined 时删除 threads.organization(manual 不写组织)。 */
+/** Serializes the policy: keeps every unknown key from the previous document (top level and inside threads), 2-space indent + trailing newline (same as delta-claude).
+ *  organization === undefined deletes threads.organization (manual writes no org). */
 export function serializeProjectPolicy(
 	previous: Record<string, unknown> | undefined,
 	mode: ThreadMode,
@@ -613,15 +614,15 @@ export function serializeProjectPolicy(
 	return JSON.stringify(document, null, 2) + "\n";
 }
 
-/** 策略是否自动记录(无需显式 /delta-share):private / organization。 */
+/** Whether the policy records automatically (no explicit /delta-share needed): private / organization. */
 export function recordsAutomatically(policy: ProjectPolicy): boolean {
 	return policy.mode === "private" || policy.mode === "organization";
 }
 
-/** session_start 的自动同步决策(#21,纯接缝,单测覆盖):
- *  - 既有绑定标记永远优先 → reconnect(auto-connect 不参与竞争,绝不绕过 marker/重连);
- *  - 无标记且策略为自动模式(带组织)→ auto-connect(调用方还要求 checkout 发现未命中);
- *  - 其余(manual/未配置/自动模式缺组织)→ manual,等显式 /delta-share。 */
+/** session_start auto-sync decision (#21, pure seam, unit-tested):
+ *  - an existing binding marker always wins → reconnect (auto-connect does not compete, never bypasses the marker/reconnect);
+ *  - no marker and the policy is an auto mode (with an org) → auto-connect (the caller additionally requires checkout discovery to have missed);
+ *  - everything else (manual/unconfigured/auto mode without an org) → manual, waiting for an explicit /delta-share. */
 export type AutoSyncAction =
 	| { kind: "reconnect"; reason: "marker" }
 	| { kind: "auto-connect"; mode: "private" | "organization"; organization: string }
@@ -635,24 +636,24 @@ export function decideAutoSyncAction(policy: ProjectPolicy, hasMarker: boolean):
 	return { kind: "manual", configured: policy.configured };
 }
 
-/** /delta-status 的策略行(#21):让"为什么自动连接了/没连"可见。 */
+/** /delta-status policy line (#21): makes "why did/didn't it auto-connect" visible. */
 export function renderProjectPolicy(p: ProjectPolicy): string {
-	if (p.problem) return "manual(策略文件无法使用:" + p.problem + ")";
-	if (!p.configured) return "manual(未配置:仅 /delta-share 手动同步;/delta-setup 可选自动)";
-	if (p.mode === "manual") return "manual(仅 /delta-share 手动同步)";
-	if (p.mode === "private") return "private(新会话自动同步,私有线程;组织 " + (p.organization ?? "?") + ")";
-	return "organization(新会话自动同步并共享给组织 " + (p.organization ?? "?") + ")";
+	if (p.problem) return "manual (policy file unusable: " + p.problem + ")";
+	if (!p.configured) return "manual (unconfigured: /delta-share manual sync only; /delta-setup can enable auto)";
+	if (p.mode === "manual") return "manual (/delta-share manual sync only)";
+	if (p.mode === "private") return "private (new sessions sync automatically as private threads; org " + (p.organization ?? "?") + ")";
+	return "organization (new sessions sync automatically and share with org " + (p.organization ?? "?") + ")";
 }
 
-// ---- /delta-setup 参数与选择器(#21,复用 #16 的 ui.select 接缝模式) ----
+// ---- /delta-setup arguments and picker (#21, reusing #16's ui.select seam pattern) ----
 
 export type SetupArgDecision =
-	| { kind: "picker" } // 无参数:交互选择器
-	| { kind: "set"; mode: ThreadMode } // 显式模式:直接写文件
-	| { kind: "invalid"; arg: string }; // 未知参数:用法提示,绝不猜测写入
+	| { kind: "picker" } // no argument: interactive picker
+	| { kind: "set"; mode: ThreadMode } // explicit mode: write the file directly
+	| { kind: "invalid"; arg: string }; // unknown argument: usage notice, never guesses a write
 
-/** /delta-setup 显式参数解析:private/priv* → private(归一化与 #16 pickShareVisibility 一致),
- *  organization/org → organization,manual → manual;大小写不敏感。 */
+/** /delta-setup explicit argument parsing: private/priv* → private (normalized the same as #16 pickShareVisibility),
+ *  organization/org → organization, manual → manual; case-insensitive. */
 export function parseSetupModeArg(args: string): SetupArgDecision {
 	const arg = String(args ?? "").trim().toLowerCase();
 	if (!arg) return { kind: "picker" };
@@ -664,43 +665,43 @@ export function parseSetupModeArg(args: string): SetupArgDecision {
 
 export type SetupModePick = { mode: ThreadMode | null; fallback: string | null };
 
-/** /delta-setup 模式选择器(无参数时):
- *  - ctx.ui.select 三选一:Private sync / Team sharing(带组织名;英文模式名与 delta-claude MODE_NAMES 对齐)/ Manual;
- *  - 非交互(select 缺失/抛错)→ 回落 manual(= 现状,绝不静默开启自动同步)并带回 fallback 文案;
- *  - 用户放弃(Esc)或无法识别的标签 → mode null,调用方按取消处理(不写文件)。 */
+/** /delta-setup mode picker (when run with no arguments):
+ *  - ctx.ui.select offers three choices: Private sync / Team sharing (with the org name; English mode names aligned with delta-claude MODE_NAMES) / Manual;
+ *  - non-interactive (select missing/throws) → fall back to manual (= current behavior, never silently enables auto-sync) with a fallback message;
+ *  - user dismisses (Esc) or an unrecognized label → mode null, caller treats it as a cancel (no file write). */
 export async function pickSetupMode(ui: any, org: { id: string; name: string } | null): Promise<SetupModePick> {
-	const orgName = org?.name || "当前组织";
+	const orgName = org?.name || "current org";
 	const options = [
-		{ label: "Private sync(私有:新会话自动同步,仅自己可见)", description: "私有线程,不共享" },
-		{ label: "Team sharing(共享:新会话自动同步并共享给 " + orgName + ")", description: "组织成员可见" },
-		{ label: "Manual(手动:仅 /delta-share 时同步)", description: "保持现状,不自动连接" },
+		{ label: "Private sync (private: new sessions sync automatically, visible only to you)", description: "Private thread, not shared" },
+		{ label: "Team sharing (shared: new sessions sync automatically and share with " + orgName + ")", description: "Visible to org members" },
+		{ label: "Manual (manual: sync only on /delta-share)", description: "Keep current behavior, no auto-connect" },
 	];
-	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>,返回所选 label
+	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>, resolves with the chosen label
 	if (typeof select !== "function") {
 		return {
 			mode: "manual",
-			fallback: "当前环境不支持交互选择,已按现状写入 manual;要启用自动同步请显式运行 /delta-setup private 或 /delta-setup organization",
+			fallback: "Interactive selection is unavailable in this environment; manual was kept as-is. To enable auto-sync, run /delta-setup private or /delta-setup organization explicitly",
 		};
 	}
 	let label: unknown;
 	try {
-		label = await select("选择本仓库的 Delta 同步策略", options);
+		label = await select("Choose the Delta sync policy for this repo", options);
 	} catch (e) {
 		return {
 			mode: "manual",
-			fallback: "策略选择器不可用(" + String(e instanceof Error ? e.message : e) + "),已按现状写入 manual;要启用自动同步请显式运行 /delta-setup private 或 /delta-setup organization",
+			fallback: "Policy picker unavailable (" + String(e instanceof Error ? e.message : e) + "); manual was kept as-is. To enable auto-sync, run /delta-setup private or /delta-setup organization explicitly",
 		};
 	}
-	if (typeof label !== "string") return { mode: null, fallback: null }; // 用户放弃(Esc)
+	if (typeof label !== "string") return { mode: null, fallback: null }; // user dismissed (Esc)
 	if (label === options[0].label) return { mode: "private", fallback: null };
 	if (label === options[1].label) return { mode: "organization", fallback: null };
 	if (label === options[2].label) return { mode: "manual", fallback: null };
-	return { mode: null, fallback: null }; // 无法识别的标签:按取消处理,不猜测写入
+	return { mode: null, fallback: null }; // unrecognized label: treat as cancel, never guess a write
 }
 
-// ---- 策略文件 IO(checkout 根;与 CLI 进程封装一样是无状态模块级函数) ----
+// ---- Policy file IO (checkout root; stateless module-level functions like the CLI process wrapper) ----
 
-/** git rev-parse --show-toplevel:checkout 根;失败/非 git 目录 → null。 */
+/** git rev-parse --show-toplevel: the checkout root; failure/non-git directory → null. */
 function gitCheckoutRoot(cwd: string): string | null {
 	try {
 		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, windowsHide: true });
@@ -712,14 +713,14 @@ function gitCheckoutRoot(cwd: string): string | null {
 	}
 }
 
-/** 读 checkout 根的 .delta/settings.json:缺文件/非 git 目录 = 未配置;读不了(权限等)= manual + problem。 */
+/** Reads the checkout root's .delta/settings.json: missing file/non-git dir = unconfigured; unreadable (permissions etc.) = manual + problem. */
 function readRepoPolicyFile(root: string): PolicyFile {
 	let text: string;
 	try {
 		text = fs.readFileSync(path.join(root, ".delta", "settings.json"), "utf8");
 	} catch (e) {
 		if ((e as any)?.code === "ENOENT") return { policy: { mode: "manual", configured: false } };
-		return { policy: { mode: "manual", configured: false, problem: "读取失败:" + String(e instanceof Error ? e.message : e) } };
+		return { policy: { mode: "manual", configured: false, problem: "Read failed: " + String(e instanceof Error ? e.message : e) } };
 	}
 	return readProjectPolicy(text);
 }
@@ -730,9 +731,9 @@ function writeRepoPolicyFile(root: string, text: string): void {
 	fs.writeFileSync(p, text, "utf8");
 }
 
-/** delta-claude 约定(setup.ts excludeFromGit):策略是个人选择,写进 <git-common-dir>/info/exclude
- *  (仓库本地、不被跟踪、不碰被跟踪的 .gitignore);条目 "/.delta/settings.json" 锚定仓库根,
- *  不会波及 Delta 自己的 .delta/ worktree 簿记目录。失败返回 false,调用方提示手动加 .gitignore。 */
+/** delta-claude convention (setup.ts excludeFromGit): the policy is a personal choice, so it goes into <git-common-dir>/info/exclude
+ *  (repo-local, untracked, leaves the tracked .gitignore untouched); the entry "/.delta/settings.json" is anchored to the repo root,
+ *  so it does not affect Delta's own .delta/ worktree bookkeeping directory. Returns false on failure; the caller suggests adding it to .gitignore manually. */
 const POLICY_EXCLUDE_ENTRY = "/.delta/settings.json";
 
 function excludeFromGit(root: string): boolean {
@@ -752,10 +753,10 @@ function excludeFromGit(root: string): boolean {
 	}
 }
 
-/** 实测回执形状:
+/** Observed receipt shape:
  *  {"operation":"appended","sequence":N,"next_sequence":N+1,"duplicate":false,
  *   "disposition":"recorded","turn_sequence":3,"version":"…"}
- *  确认结论在 disposition(recorded/duplicate/fenced);兼容旧式 status 字段。 */
+ *  The verdict lives in disposition (recorded/duplicate/fenced); the legacy status field is accepted for compatibility. */
 export function collectReceipts(j: any, into: Map<number, string>) {
 	const items: any[] = Array.isArray(j)
 		? j
@@ -772,8 +773,8 @@ export function collectReceipts(j: any, into: Map<number, string>) {
 	}
 }
 
-/** 从 lastAcked 起找最大连续确认前缀(有空洞时不越过未确认记录)。
- *  pending 只含未确认记录,bySeq 以它为准:超出 pending 的回执不能延长前缀。 */
+/** Finds the largest contiguous acked prefix starting from lastAcked (never jumps over unacked records on a hole).
+ *  pending holds only unacked records and bySeq is built from it: receipts beyond pending cannot extend the prefix. */
 export function contiguousAck(pending: DeltaRecord[], lastAcked: number, receipts: Map<number, string>): number {
 	const acked = new Map<number, boolean>();
 	for (const [seq, st] of receipts) acked.set(seq, st === "recorded" || st === "duplicate");
@@ -792,7 +793,7 @@ export type AppendClassification = {
 	errMsg: string;
 };
 
-/** 把 append 的退出码/输出/回执归类:接管、可重试、供给窗口、退避时长、错误消息。 */
+/** Classifies the append's exit code/output/receipts: takeover, retryable, provisioning window, backoff duration, error message. */
 export function classifyAppendResult(
 	code: number,
 	err: string,
@@ -813,8 +814,8 @@ export function classifyAppendResult(
 					retryable = true;
 					retryAfter = Number(j.error.retry_after_ms) || 5_000;
 				}
-				// 新线程的 history 供给窗口期(实测可达数十分钟):暂不可见但可自愈,
-				// 统一用 30s 长退避,不采信服务端短值
+				// A new thread's history provisioning window (observed to last tens of minutes): temporarily invisible but self-healing,
+				// so use a uniform 30s long backoff and don't trust the server's short value
 				const reason = String(j.error.reason ?? "");
 				if (reason === "not_visible" || NOT_VISIBLE_RE.test(errMsg)) {
 					notVisible = true;
@@ -823,7 +824,7 @@ export function classifyAppendResult(
 				}
 			}
 		}
-		// JSON 解析失败时的原始文本兑底:CLI 某些报错不带 JSON
+		// Raw-text fallback when JSON parsing fails: some CLI errors carry no JSON
 		const rawText = String(err || "") + String(out || "");
 		if (!retryable && !notVisible && NOT_VISIBLE_RE.test(rawText)) {
 			notVisible = true;
@@ -834,14 +835,14 @@ export function classifyAppendResult(
 		if (!errMsg) errMsg = (err || out || "exit " + code).slice(0, 300);
 	}
 	if (code === -1) {
-		// spawn 失败或超时被杀:没有 JSON 错误体,按可重试故障处理
+		// spawn failure or a killed timeout: no JSON error body, treat as a retryable failure
 		retryable = true;
-		if (!errMsg) errMsg = "delta 进程无响应或被终止";
+		if (!errMsg) errMsg = "delta process unresponsive or terminated";
 	}
 	return { fenced, retryable, notVisible, retryAfter, errMsg };
 }
 
-/** append 请求体:每行一个 envelope,schemaVersion + sequence(+ turnSequence)。 */
+/** append request body: one envelope per line, schemaVersion + sequence (+ turnSequence). */
 export function buildAppendEnvelope(pending: DeltaRecord[]): string {
 	return (
 		pending
@@ -854,12 +855,12 @@ export function buildAppendEnvelope(pending: DeltaRecord[]): string {
 	);
 }
 
-/** 供给窗口期错误:服务端尚未可见,可后台重试。 */
+/** Provisioning-window error: not yet visible server-side; safe to retry in the background. */
 export function isTransientProvisioning(msg: string): boolean {
 	return PROVISIONING_RE.test(msg);
 }
 
-/** 参照 delta-claude:实时活动带 _meta.delta 来源标记,否则外部 producer 的 agent 输出不会被渲染进 transcript。 */
+/** Following delta-claude: live activity carries a _meta.delta source marker, otherwise an external producer's agent output is not rendered into the transcript. */
 export function liveActivity(update: Record<string, unknown>): Record<string, unknown> {
 	const kind = update.sessionUpdate;
 	const activityKind =
@@ -877,27 +878,27 @@ export function liveActivity(update: Record<string, unknown>): Record<string, un
 	};
 }
 
-// ---- 同步状态指示(#18):状态→文案的纯接缝,单测覆盖;交互绘制在工厂闭包内 ----
-// 表面选型与生命周期研究见 docs/status-indicator-research.md(ctx.ui.setStatus 槽位)。
+// ---- Sync status indicator (#18): pure status→label seam, unit-tested; interactive painting lives in the factory closure ----
+// Surface selection and lifecycle research in docs/status-indicator-research.md (the ctx.ui.setStatus slot).
 
 export type SyncIndicatorState = "synced" | "supplying" | "offline" | "detached";
 
-/** deriveSyncIndicatorState 的输入:Runtime 里参与状态判定的字段快照。 */
+/** Inputs to deriveSyncIndicatorState: a snapshot of the Runtime fields involved in the state decision. */
 export type SyncIndicatorInput = {
 	connected: boolean;
 	paused: boolean;
-	detached: boolean; // 用户显式 detach(#18):指示清槽直到重连
-	expectingIdentity: boolean; // 重连在途:记录入临时队列等游标
+	detached: boolean; // explicit user detach (#18): the indicator clears its slot until reconnect
+	expectingIdentity: boolean; // reconnect in flight: records queue temporarily awaiting the cursor
 	threadId: string | null;
-	pendingCount: number; // 未确认记录(rt.pending.length)
-	retryAttempts: number; // 推送自动重试计数(>0 = 重试窗口)
-	historyWaitAttempts: number; // 供给窗口等待计数(>0 = 等待可见)
-	connectAttempts: number; // 后台重连计数(>0 = 重连窗口)
+	pendingCount: number; // unacked records (rt.pending.length)
+	retryAttempts: number; // push auto-retry counter (>0 = retry window)
+	historyWaitAttempts: number; // provisioning window wait counter (>0 = waiting for visibility)
+	connectAttempts: number; // background reconnect counter (>0 = reconnect window)
 };
 
-/** Runtime 字段 → 指示状态:detached(显式 detach 或从未绑定:清槽)/ offline(有绑定但断开且无在途重连,或暂停)/
- *  supplying(已连接有在途工作,或断线但重连/供给在途:记录仍在排队)/ synced(空闲已连接)。
- *  优先级:detached > paused > 在途重连(supplying:重连窗口期记录仍入队)> 断线 offline > supplying > synced。 */
+/** Runtime fields → indicator state: detached (explicit detach, or never bound: clears the slot) / offline (bound but disconnected with no reconnect in flight, or paused) /
+ *  supplying (connected with work in flight, or disconnected while reconnect/provisioning is in flight: records still queue) / synced (idle and connected).
+ *  Priority: detached > paused > reconnect in flight (supplying: records keep queueing during the retry window) > disconnect offline > supplying > synced. */
 export function deriveSyncIndicatorState(input: SyncIndicatorInput): SyncIndicatorState {
 	if (input.detached || (!input.threadId && !input.connected)) return "detached";
 	if (input.paused) return "offline";
@@ -909,7 +910,7 @@ export function deriveSyncIndicatorState(input: SyncIndicatorInput): SyncIndicat
 	return "synced";
 }
 
-/** 线程短 id:thread_ 前缀是常量,先剥掉再截前 8 字符(否则只剩无信息量的 thread_0)。 */
+/** Short thread id: the thread_ prefix is constant, so strip it before taking the first 8 characters (otherwise only the uninformative thread_0 remains). */
 export function shortThreadId(threadId: string): string {
 	const bare = threadId.startsWith("thread_") ? threadId.slice("thread_".length) : threadId;
 	return bare.slice(0, 8);
@@ -921,19 +922,19 @@ const SYNC_STATE_LABELS: Record<Exclude<SyncIndicatorState, "detached">, string>
 	offline: "offline",
 };
 
-/** 状态 → 指示文案 `Δ <短id> · <状态>`;detached → null(调用方据此清槽)。
- *  threadId 为 null 的防御路径渲染为空短 id(connected 时实际不可达:连接必先有 threadId)。 */
+/** State → indicator label `Δ <short id> · <state>`; detached → null (the caller clears the slot accordingly).
+ *  A defensive path with a null threadId renders an empty short id (actually unreachable when connected: connecting always has a threadId first). */
 export function renderStatusIndicator(state: SyncIndicatorState, threadId: string | null): string | null {
 	if (state === "detached") return null;
 	return "Δ " + shortThreadId(String(threadId ?? "")) + " · " + SYNC_STATE_LABELS[state];
 }
 
-/** 路径归一化比较(Windows/POSIX 分隔符与大小写)。 */
+/** Path-normalized comparison (Windows/POSIX separators and casing). */
 function normPath(p: string): string {
 	return p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
 }
 
-// ---- 身份与游标:服务端为权威,本地不落盘 ----
+// ---- Identity and cursor: the server is authoritative; nothing persists locally ----
 
 export type DeltaIdentity = {
 	threadId: string;
@@ -945,8 +946,8 @@ export type DeltaIdentity = {
 	title?: string;
 };
 
-/** 从 `thread status` 解析可续录的线程身份。
- *  注意:join url 是 share id(thread_01…),与 thread_id 无派生关系,只能取字段本身。 */
+/** Parses a resumable thread identity from `thread status`.
+ *  Note: the join url is a share id (thread_01…), unrelated by derivation to thread_id; only the field itself can be used. */
 export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
 	const threadId = String(status?.thread_id ?? "");
 	if (!threadId) return null;
@@ -964,8 +965,8 @@ export function resolveIdentityFromStatus(status: any): DeltaIdentity | null {
 
 export type WorktreePick = { ref: string; ambiguous: boolean };
 
-/** 一个 worktree 条目上报的所有 checkout 目录:顶层 path/directory + 嵌套 checkouts[].directory
- *  (实采形状:delta 会把 checkout 物化在 <cwd>/.delta/worktrees/<uuid>/… 下,state 可为 inactive)。 */
+/** All checkout directories reported by one worktree entry: top-level path/directory + nested checkouts[].directory
+ *  (observed shape: delta materializes checkouts under <cwd>/.delta/worktrees/<uuid>/…, state may be inactive). */
 function worktreeDirs(item: any): string[] {
 	const dirs: string[] = [];
 	const direct = String(item?.path ?? item?.directory ?? "");
@@ -977,8 +978,8 @@ function worktreeDirs(item: any): string[] {
 	return dirs;
 }
 
-/** 从 worktree 列表里挑出当前 checkout 的身份;多个匹配必须报歧义,不静默选择。
- *  匹配规则:目录相等,或是当前 cwd 下 .delta/ 受管子树(delta 物化的 checkout)。 */
+/** Picks the current checkout's identity from a worktree list; multiple matches must be reported as ambiguous, never silently chosen.
+ *  Match rule: directory equality, or a delta-managed .delta/ subtree under the current cwd (a delta-materialized checkout). */
 export function pickWorktreeForCwd(items: any[], cwd: string): WorktreePick {
 	const base = normPath(cwd);
 	const matches = items.filter((x) =>
@@ -993,10 +994,10 @@ export function pickWorktreeForCwd(items: any[], cwd: string): WorktreePick {
 
 export type SequenceState = { pending: DeltaRecord[]; seq: number; lastAcked: number };
 
-/** 用服务端游标(next_sequence = 已送达条数)对齐本地队列:
- *  丢掉服务端已有的记录,序列号从服务端游标继续 —— 重启/换机后零本地状态也能衔接。 */
+/** Aligns the local queue with the server cursor (next_sequence = number of delivered records):
+ *  drops records the server already has and continues sequence numbers from the server cursor — after a restart/machine switch, zero local state still reconnects seamlessly. */
 export function reconcileSequenceState(pending: DeltaRecord[], serverNext: number): SequenceState {
-	const cursor = Math.max(0, serverNext - 1); // 服务端已确认到的最大 seq
+	const cursor = Math.max(0, serverNext - 1); // the largest seq the server has acked
 	const kept = pending.filter((r) => r.seq > cursor);
 	let seq = cursor;
 	for (const r of kept) if (r.seq > seq) seq = r.seq;
@@ -1005,11 +1006,11 @@ export function reconcileSequenceState(pending: DeltaRecord[], serverNext: numbe
 
 export type RenumberResult = { pending: DeltaRecord[]; seq: number; lastAcked: number; seqMap: Map<number, number> };
 
-/** 首次对齐用:临时队列里的记录从未上过服务端,可安全重编号衔接服务端游标;
- *  内部 turnSequence 引用(指向同队列的 running 记录)经同一映射修正。原地改写 pending。 */
+/** For the first alignment: records in the temporary queue never reached the server, so they can be safely renumbered onto the server cursor;
+ *  internal turnSequence references (pointing at the running record in the same queue) are fixed through the same map. Rewrites pending in place. */
 export function renumberFrom(pending: DeltaRecord[], serverNext: number): RenumberResult {
 	const seqMap = new Map<number, number>();
-	let s = Math.max(1, serverNext); // 全新 producer 从 1 起;已有游标从 next_sequence 继续
+	let s = Math.max(1, serverNext); // a brand-new producer starts at 1; an existing cursor continues from next_sequence
 	for (const r of pending) {
 		seqMap.set(r.seq, s);
 		if (r.turnSequence !== undefined && seqMap.has(r.turnSequence)) {
@@ -1021,17 +1022,17 @@ export function renumberFrom(pending: DeltaRecord[], serverNext: number): Renumb
 	return { pending, seq: s - 1, lastAcked: Math.max(0, serverNext - 1), seqMap };
 }
 
-// ---- /delta-update:delta update 包装(#20) ----
+// ---- /delta-update: delta update wrapper (#20) ----
 
-/** 实测 `delta --json update --check` 输出(JSONL 两行;up-to-date 时 `delta update`
- *  输出同形,见 docs/contract-notes.md):
+/** Observed `delta --json update --check` output (two JSONL lines; `delta update` prints the same shape when up to date,
+ *  see docs/contract-notes.md):
  *  {"schema_version":1,"type":"progress","phase":"checking"}
  *  {"schema_version":1,"status":"up_to_date","current_version":"0.23.0",
  *   "latest_version":"0.23.0","channel":"stable","can_install":true,
  *   "message":"Delta 0.23.0 is up to date."}
- *  progress 帧没有 status;取最后一个带 status 的对象。up_to_date 之外的状态一律
- *  视为需要安装/重启 —— `delta update --help`:"A running Delta app restarts to
- *  install it"(仅 up_to_date 形状实采过,其余防御性解析)。 */
+ *  progress frames have no status; take the last object that has one. Any status other than up_to_date is
+ *  treated as install/restart required — `delta update --help`: "A running Delta app restarts to
+ *  install it" (only the up_to_date shape was observed live; the rest is parsed defensively). */
 export type DeltaUpdateParsed = {
 	status: string;
 	currentVersion: string;
@@ -1061,62 +1062,62 @@ export function parseUpdateResult(text: string): DeltaUpdateParsed | null {
 	};
 }
 
-/** 插件过期的唯一可靠程序化信号:omp 加载的就是安装目录里的这份构建,其支持上限
- *  是编译期常量 CONTRACT_MAX;`thread contract` 的 min 超过它 ⇒ 本插件对当前 Delta
- *  过旧,必须重装。安装目录 package.json 只有本地版本、没有"最新版"参照(联网查
- *  GitHub 不做:网络依赖且非 marketplace 语义),除此之外没有离线信号 —— 此时
- *  只剩 renderUpdateReport 的常量页脚提示。 */
+/** The only reliable programmatic outdated-plugin signal: omp loads exactly this build from the install directory, whose support
+ *  ceiling is the compile-time constant CONTRACT_MAX; if `thread contract`'s min exceeds it, this plugin is outdated for the
+ *  current Delta and must be reinstalled. The install directory's package.json only carries a local version, with no "latest"
+ *  reference (no networked GitHub lookup: that adds a network dependency and isn't marketplace semantics); beyond this there is
+ *  no offline signal — all that remains is renderUpdateReport's constant footer hint. */
 export function pluginOutdatedFromContract(contract: { min?: unknown } | null | undefined): boolean {
 	const min = Number(contract?.min);
 	return Number.isFinite(min) && min > CONTRACT_MAX;
 }
 
 const UPDATE_RESTART_NOTE =
-	"重启说明:Delta 应用会自动重启完成安装;omp 侧建议 /delta-retry 重连(或重启 omp),让 mount/watch 子进程改用新版 CLI。";
+	"Restart note: the Delta app restarts automatically to finish installing; on the omp side, run /delta-retry to reconnect (or restart omp) so the mount/watch subprocesses pick up the new CLI.";
 const PLUGIN_HINT_FOOTER =
-	"提示:omp 没有 marketplace 自动更新,omp-delta 插件过期时不会自动升级;如需更新请重装: " + PLUGIN_REINSTALL_CMD;
+	"Hint: omp has no marketplace auto-update, so an outdated omp-delta plugin never upgrades itself; to update, reinstall: " + PLUGIN_REINSTALL_CMD;
 
 export type UpdateReportInput = {
 	mode: "check" | "update";
 	result: DeltaUpdateParsed | null;
-	errorText?: string; // 非零退出/无 JSON 时的原始输出
-	contractMin?: number | null; // thread contract 的 min(拿不到为 null:不下结论)
+	errorText?: string; // raw output when the exit code was non-zero / no JSON came back
+	contractMin?: number | null; // min from thread contract (null when unavailable: no verdict)
 };
 
-/** /delta-update 的汇报文本:版本状态 / 安装结果 / 重启要求 / 插件重装提示。
- *  重装提示是常量页脚,每次 check/update 后都出现 —— 插件过期没有可靠的离线信号,
- *  这条是唯一保证到位的指引(pluginOutdatedFromContract 只在合约 min 超上限时
- *  把提示升级为"必须重装")。 */
+/** Report text for /delta-update: version status / install result / restart requirement / plugin reinstall hint.
+ *  The reinstall hint is a constant footer that appears after every check/update — there is no reliable offline signal
+ *  for a plugin being outdated, so this is the only guidance guaranteed to land (pluginOutdatedFromContract only
+ *  escalates the hint to "must reinstall" when the contract min exceeds the ceiling). */
 export function renderUpdateReport(input: UpdateReportInput): string {
 	const lines: string[] = [];
 	const check = input.mode === "check";
 	if (pluginOutdatedFromContract({ min: input.contractMin })) {
 		lines.push(
-			"检测到 omp-delta 插件对当前 Delta 过旧(合约 min " + input.contractMin + " > 插件支持 " + CONTRACT_MAX + "),必须重装: " + PLUGIN_REINSTALL_CMD,
+			"Detected that the omp-delta plugin is outdated for the current Delta (contract min " + input.contractMin + " > plugin supports " + CONTRACT_MAX + "); you must reinstall: " + PLUGIN_REINSTALL_CMD,
 		);
 	}
 	const p = input.result;
 	if (!p) {
-		const raw = (input.errorText ?? "").trim() || "无输出";
-		lines.push((check ? "Delta 更新检查失败" : "Delta 更新失败") + ": " + raw.slice(0, 300));
+		const raw = (input.errorText ?? "").trim() || "no output";
+		lines.push((check ? "Delta update check failed" : "Delta update failed") + ": " + raw.slice(0, 300));
 	} else if (p.status === "up_to_date") {
 		lines.push(
-			(check ? "Delta 更新检查:" : "Delta 更新:") + "已是最新(" + p.currentVersion + (p.channel ? "," + p.channel : "") + ")" + (check ? "。仅检查,未安装任何内容。" : "."),
+			(check ? "Delta update check: " : "Delta update: ") + "already up to date (" + p.currentVersion + (p.channel ? ", " + p.channel : "") + ")" + (check ? ". Check only, nothing was installed." : "."),
 		);
 	} else if (check) {
 		lines.push(
-			"Delta 更新检查:发现新版本 " + p.latestVersion + "(当前 " + p.currentVersion + (p.channel ? "," + p.channel : "") + ")。仅检查,未安装;运行 /delta-update 安装。",
+			"Delta update check: new version " + p.latestVersion + " found (current " + p.currentVersion + (p.channel ? ", " + p.channel : "") + "). Check only, nothing was installed; run /delta-update to install.",
 		);
 		lines.push(UPDATE_RESTART_NOTE);
 	} else {
-		lines.push("Delta 更新(" + p.status + "):" + (p.message || ("current " + p.currentVersion + " → latest " + p.latestVersion)));
+		lines.push("Delta update (" + p.status + "): " + (p.message || ("current " + p.currentVersion + " → latest " + p.latestVersion)));
 		lines.push(UPDATE_RESTART_NOTE);
 	}
 	lines.push(PLUGIN_HINT_FOOTER);
 	return lines.join("\n");
 }
 
-// ---- 扩展工厂:每会话一份 Runtime ----
+// ---- Extension factory: one Runtime per session ----
 
 export default function ompDelta(pi: any) {
 	const rt: Runtime = {
@@ -1146,7 +1147,7 @@ export default function ompDelta(pi: any) {
 		mountChild: null,
 		watchChild: null,
 	};
-	// 供无 ctx 回调(如子进程 onClose)兜底使用的最新命令/事件 ctx
+	// Most recent command/event ctx, for fallback in callbacks without one (e.g. subprocess onClose)
 	let lastCtx: any = null;
 
 	function log(msg: string) {
@@ -1166,22 +1167,22 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	// ---- 同步状态指示(#18):ctx.ui.setStatus 键槽(footer 状态带,研究见 docs/status-indicator-research.md) ----
-	// 键槽在 status-line 组件内持久(变更才失效渲染缓存,同文案上游还会再 dedup),
-	// 与 pi 自身 link-hint(omp:link-hints)共存;不与 Orca 标题栏 spinner 抢 title。
+	// ---- Sync status indicator (#18): ctx.ui.setStatus key slot (footer status band; research in docs/status-indicator-research.md) ----
+	// The key slot persists inside the status-line component (changes invalidate the render cache; identical labels get deduped upstream),
+	// coexists with pi's own link-hint (omp:link-hints); does not compete with the Orca title-bar spinner for title.
 	const STATUS_KEY = "omp-delta:sync";
-	let paintedStatus: string | null | undefined = undefined; // undefined = 从未绘制
+	let paintedStatus: string | null | undefined = undefined; // undefined = never painted
 
-	/** 状态转移后重绘指示。每次绘制都走 spinner 同款守卫:ctx.ui 在
-	 *  session-replacing dialog 作废 runner 后可能抛错 —— 吞掉且不更新 paintedStatus,
-	 *  下一处转移自然重试;表面缺失则跳过绘制并只提醒一次(模块级去重)。 */
+	/** Repaints the indicator after a state transition. Every paint goes through the same guard as the spinner: ctx.ui may
+	 *  throw after a session-replacing dialog invalidated the runner — swallow it and leave paintedStatus untouched;
+	 *  the next transition naturally retries. If the surface is missing, skip painting and warn only once (module-level dedup). */
 	function paintStatus(ctx?: any): void {
 		const ui = (ctx ?? lastCtx ?? rt.eventCtx)?.ui;
 		const setStatus = ui?.setStatus;
 		if (typeof setStatus !== "function") {
 			if (!statusSurfaceWarned) {
 				statusSurfaceWarned = true;
-				notify("当前 omp 环境没有状态栏槽位(ctx.ui.setStatus),同步状态指示已停用。", "warning");
+				notify("This omp environment has no status-bar slot (ctx.ui.setStatus); the sync status indicator is disabled.", "warning");
 			}
 			return;
 		}
@@ -1199,16 +1200,16 @@ export default function ompDelta(pi: any) {
 			}),
 			rt.threadId,
 		);
-		if (text === paintedStatus) return; // 无变化不跨扩展边界
+		if (text === paintedStatus) return; // no change, don't cross the extension boundary
 		try {
 			setStatus.call(ui, STATUS_KEY, text ?? undefined);
-			paintedStatus = text; // spinner 纪律:绘制成功后才落状态,失败的绘制由下一转移重试
+			paintedStatus = text; // spinner discipline: record the state only after a successful paint; a failed paint is retried by the next transition
 		} catch {
-			/* runner 已作废:吞掉 */
+			/* runner already invalidated: swallow */
 		}
 	}
 
-	/** 直接清槽(session_shutdown 用:2s 预算内的一次同步调用,不做状态推导)。 */
+	/** Clears the slot directly (used by session_shutdown: one synchronous call within the 2s budget, no state derivation). */
 	function clearStatus(): void {
 		const ui = (lastCtx ?? rt.eventCtx)?.ui;
 		const setStatus = ui?.setStatus;
@@ -1217,13 +1218,13 @@ export default function ompDelta(pi: any) {
 			setStatus.call(ui, STATUS_KEY, undefined);
 			paintedStatus = null;
 		} catch {
-			/* runner 已作废 */
+			/* runner already invalidated */
 		}
 	}
 
 	function shouldRecord(): boolean {
-		// 重连在途(expectingIdentity)时也记录:进临时队列,游标到达后安全重编号;
-		// 没有任何绑定前景时才丢弃。
+		// Also record while a reconnect is in flight (expectingIdentity): into the temporary queue, safely renumbered once the cursor arrives;
+		// dropped only when there is no binding prospect at all.
 		return !rt.isSub && !rt.paused && (rt.seqReady || rt.expectingIdentity);
 	}
 
@@ -1232,23 +1233,23 @@ export default function ompDelta(pi: any) {
 		return rt.seq;
 	}
 
-	/** 分配 sequence、入队、尝试推送。无绑定前景或已暂停时返回 null。 */
+	/** Assigns a sequence, enqueues, and attempts a push. Returns null when there is no binding prospect or recording is paused. */
 	function emit(update: Record<string, unknown>, opts?: { turnSequence?: number; sequence?: number }): number | null {
-		// 记录只进内存队列:权威内容在 omp session JSONL,权威送达游标在服务端。
-		// seqReady 前的记录走临时编号,游标到达时由 adoptServerCursor 重编号。
+		// Records go into the in-memory queue only: the authoritative content is the omp session JSONL, the authoritative delivery cursor is the server.
+		// Records emitted before seqReady use temporary numbering, renumbered by adoptServerCursor when the cursor arrives.
 		if (!shouldRecord()) return null;
 		const seq = opts?.sequence ?? nextSeq();
 		const rec: DeltaRecord = { seq, update: liveActivity(update) };
 		if (opts?.turnSequence !== undefined) rec.turnSequence = opts.turnSequence;
 		rt.pending.push(rec);
-		paintStatus(); // 入队:synced → supplying(空转窗口期也已由 expectingIdentity 覆盖)
+		paintStatus(); // enqueued: synced → supplying (idle windows are already covered by expectingIdentity)
 		void flush();
 		return seq;
 	}
 
 	let flushing = false;
 
-	/** 定时调度:优先事件 ctx 的托管定时器(异常隔离),否则原生 setTimeout 兜底。 */
+	/** Timed scheduling: prefer the event ctx's managed timers (exception-isolated), else fall back to native setTimeout. */
 	function schedule(fn: () => void, ms: number) {
 		const managed = (rt.eventCtx ?? lastCtx)?.setTimeout?.(fn, ms);
 		if (!managed) {
@@ -1257,7 +1258,7 @@ export default function ompDelta(pi: any) {
 		}
 	}
 
-	/** 把未确认记录推给 Delta;可重试错误自动退避,重试耗尽则暂停。 */
+	/** Pushes unacked records to Delta; retryable errors back off automatically, and push pauses when retries run out. */
 	async function flush(): Promise<void> {
 		if (!rt.threadId || !rt.seqReady || flushing || rt.paused) return;
 		flushing = true;
@@ -1266,12 +1267,12 @@ export default function ompDelta(pi: any) {
 			if (pending.length === 0) {
 				if (rt.retryAttempts !== 0) {
 					rt.retryAttempts = 0;
-					paintStatus(); // 重试窗口结束
+					paintStatus(); // retry window over
 				}
 				return;
 			}
 
-			// 已确认记录已从队列移除;重发未确认记录安全(Delta 返回 duplicate)
+			// Acked records have left the queue; re-sending unacked records is safe (Delta returns duplicate)
 			const body = buildAppendEnvelope(pending);
 
 			const r = await runDelta(
@@ -1296,8 +1297,8 @@ export default function ompDelta(pi: any) {
 			const cls = classifyAppendResult(r.code, r.err, r.out, receipts);
 
 			if (cls.fenced) {
-				// 该 turn 已被他人接管:合约要求停止本地 turn(已执行的工具效果无法撤销)
-				notify("Delta:该 turn 已被他人接管,本地 turn 已停止。", "warning");
+				// This turn has been taken over by someone else: the contract requires stopping the local turn (already-executed tool effects cannot be undone)
+				notify("Delta: this turn was taken over by someone else; the local turn has been stopped.", "warning");
 				const ack = contiguousAck(pending, rt.lastAcked, receipts);
 				rt.lastAcked = Math.max(rt.lastAcked, ack);
 				rt.pending = rt.pending.filter((rec) => rec.seq > rt.lastAcked);
@@ -1305,7 +1306,7 @@ export default function ompDelta(pi: any) {
 				try {
 					lastCtx?.abort?.();
 				} catch {
-					/* 无进行中 turn */
+					/* no turn in progress */
 				}
 				paintStatus();
 				return;
@@ -1314,7 +1315,7 @@ export default function ompDelta(pi: any) {
 			const newAck = contiguousAck(pending, rt.lastAcked, receipts);
 			if (newAck > rt.lastAcked) {
 				rt.lastAcked = newAck;
-				// 已确认记录出队(内存队列,无需落盘)
+				// Acked records leave the queue (in-memory queue, no persistence needed)
 				rt.pending = rt.pending.filter((rec) => rec.seq > rt.lastAcked);
 				rt.retryAttempts = 0;
 				rt.historyWaitAttempts = 0;
@@ -1324,8 +1325,8 @@ export default function ompDelta(pi: any) {
 				if (cls.retryable && cls.notVisible && rt.historyWaitAttempts < MAX_HISTORY_WAIT_ATTEMPTS) {
 					rt.historyWaitAttempts += 1;
 					notify(
-						"Delta 线程供给中,等待可见("
-						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "):" + cls.errMsg,
+						"Delta thread provisioning, waiting for visibility ("
+						+ rt.historyWaitAttempts + "/" + MAX_HISTORY_WAIT_ATTEMPTS + "): " + cls.errMsg,
 					);
 					paintStatus();
 					schedule(() => {
@@ -1334,7 +1335,7 @@ export default function ompDelta(pi: any) {
 				} else if (cls.retryable && rt.retryAttempts < MAX_AUTO_RETRIES) {
 					rt.retryAttempts += 1;
 					notify(
-						"Delta 推送失败,自动重试 " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + "(" + cls.errMsg + ")",
+						"Delta push failed, auto-retry " + rt.retryAttempts + "/" + MAX_AUTO_RETRIES + " (" + cls.errMsg + ")",
 						"warning",
 					);
 					paintStatus();
@@ -1343,12 +1344,12 @@ export default function ompDelta(pi: any) {
 					}, cls.retryAfter);
 				} else {
 					rt.paused = true;
-					notify("Delta 推送失败,已暂停自动重试:" + cls.errMsg + "(用 /delta-retry 恢复)", "warning");
+					notify("Delta push failed, auto-retry paused: " + cls.errMsg + " (use /delta-retry to resume)", "warning");
 					paintStatus();
 				}
 			}
 			if (r.code === 0 && rt.lastAcked < rt.seq) {
-				// 部分确认:安排跟进推送;连续无进展则暂停(计数由有进展时归零)
+				// Partial ack: schedule a follow-up push; pause after consecutive no-progress attempts (the counter resets on progress)
 				if (rt.retryAttempts < MAX_AUTO_RETRIES) {
 					rt.retryAttempts += 1;
 					lastCtx?.setTimeout?.(() => {
@@ -1356,12 +1357,13 @@ export default function ompDelta(pi: any) {
 					}, 1_000);
 				} else {
 					rt.paused = true;
-					notify("Delta 仍有未同步记录,自动重试已达上限(用 /delta-retry 恢复)", "warning");
-				}
+					notify("Delta still has unsynced records and auto-retry has hit its limit (use /delta-retry to resume)", "warning");
+				notify("Delta still has unsynced records and auto-retry has hit its limit (use /delta-retry to resume)", "warning");
 			}
-			paintStatus(); // 覆盖上面所有分支:确认进展(清队列)/ 重试窗口 / 供给等待 / 暂停
+		}
+		paintStatus(); // covers all branches above: ack progress (queue drain) / retry window / provisioning wait / pause
 		} catch (e) {
-			log("flush 异常: " + String(e));
+			log("flush exception: " + String(e));
 		} finally {
 			flushing = false;
 		}
@@ -1384,23 +1386,23 @@ export default function ompDelta(pi: any) {
 			try {
 				onLine(JSON.parse(t), t);
 			} catch (e) {
-				log("子进程输出解析失败: " + String(e));
+				log("failed to parse subprocess output: " + String(e));
 			}
 		});
 		child.stderr?.on("data", () => {
-			/* 诊断输出 MVP 不消费 */
+			/* diagnostic output not consumed in MVP */
 		});
-		// exit 而非 close:Windows 上孙进程握住管道时 close 永不触发(watch 断开误报为未断开)
+		// exit rather than close: on Windows, when a grandchild holds the pipes, close never fires (a watch disconnect would be misreported as still connected)
 		child.on("exit", (code) => {
 			try {
 				rl.close();
 			} catch {
-				/* 已关闭 */
+				/* already closed */
 			}
 			onClose(code ?? -1);
 		});
 		child.on("error", (e) => {
-			log("子进程启动失败: " + String(e));
+			log("subprocess failed to start: " + String(e));
 			onClose(-1);
 		});
 		return child;
@@ -1410,7 +1412,7 @@ export default function ompDelta(pi: any) {
 		try {
 			child?.kill("SIGTERM");
 		} catch {
-			/* 已退出 */
+			/* already exited */
 		}
 	}
 
@@ -1420,25 +1422,25 @@ export default function ompDelta(pi: any) {
 			const c = j?.comment ?? j;
 			const text = String(c?.text ?? "").trim();
 			if (!text) return;
-			const who = String(c?.author ?? c?.creator ?? "队友").slice(0, 40);
-			// 合约要求:远端活动进上下文,但不自动触发 turn → followUp(空闲时只入上下文)
-			pi?.sendMessage?.("[Delta 评论 · " + who + "] " + text, {
+			const who = String(c?.author ?? c?.creator ?? "teammate").slice(0, 40);
+			// Contract requirement: remote activity enters context but never auto-triggers a turn → followUp (context-only while idle)
+			pi?.sendMessage?.("[Delta comment · " + who + "] " + text, {
 				deliverAs: "followUp",
 				attribution: "agent",
 			});
-			notify("收到 Delta 评论,已作为 follow-up 进入 omp 上下文。");
+			notify("Received a Delta comment; it entered omp context as a follow-up.");
 			return;
 		}
 		if (type === "producer.turn" && JSON.stringify(j).includes("supersede")) {
-			notify("Delta:你的 turn 已被接管,正在停止本地 turn。", "warning");
+			notify("Delta: your turn has been taken over; stopping the local turn.", "warning");
 			rt.currentTurn = null;
 			try {
 				lastCtx?.abort?.();
 			} catch {
-				/* 无进行中 turn */
+				/* no turn in progress */
 			}
 		}
-		// item / turn / presence / worktrees / children 等 MVP 暂不消费
+		// item / turn / presence / worktrees / children etc. are not consumed in the MVP
 	}
 
 	function startWatch() {
@@ -1459,30 +1461,30 @@ export default function ompDelta(pi: any) {
 			(code) => {
 				rt.watchChild = null;
 				if (!rt.detaching && rt.connected) {
-					notify("Delta watch 断开(exit " + code + "),评论回流暂停;/delta-retry 可重连。", "warning");
+					notify("Delta watch disconnected (exit " + code + "); comment flow-back is paused. /delta-retry can reconnect.", "warning");
 				}
 			},
 		);
 	}
 
-	/** 已有线程:挂载 worktree + 启动 watch + 推送积压记录。 */
-	/** 从 omp 会话条目里取最新的绑定标记(appendEntry 写入;无则 null)。 */
+	/** Existing thread: attach the worktree + start watch + push the backlog. */
+	/** Reads the latest binding marker from omp session entries (written by appendEntry; null when absent). */
 	function findSessionMarker(ctx: any): { threadId: string; worktreeRef?: string; cwd?: string } | null {
 		try {
 			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
 			let marker: { threadId: string; worktreeRef?: string } | null = null;
 			for (const e of entries) {
 				if (e?.type === "custom" && e?.customType === MARKER_TYPE && e?.data?.threadId) {
-					marker = e.data; // 取最后一个 = 最新绑定
+					marker = e.data; // take the last one = the latest binding
 				}
 			}
 			return marker;
 		} catch {
-			return null; // 无会话读取能力时只能手动 /delta-share
+			return null; // without session read access, only a manual /delta-share works
 		}
 	}
 
-	/** 把对齐结果落进运行时:服务端游标为准,seqReady 放行 flush/emit。 */
+	/** Landing the alignment result into the runtime: the server cursor is authoritative; seqReady gates flush/emit. */
 	function applySequenceState(rc: { pending: DeltaRecord[]; seq: number; lastAcked: number }) {
 		rt.pending = rc.pending;
 		rt.seq = rc.seq;
@@ -1490,9 +1492,9 @@ export default function ompDelta(pi: any) {
 		rt.seqReady = true;
 	}
 
-	/** 游标到达时的统一入口:已发送过的队列用 reconcile(丢已送达、保未送达),
-	 *  临时队列(重连在途期间排队的记录)用 renumberFrom(从未上服务端,安全重编号,
-	 *  内部 turnSequence 引用与 currentTurn 一并映射)。 */
+	/** Single entry when the cursor arrives: queues that already went to the server use reconcile (drop delivered, keep undelivered),
+	 *  the temporary queue (records queued while a reconnect was in flight) uses renumberFrom (never reached the server, safe to renumber;
+	 *  internal turnSequence references and currentTurn are mapped together). */
 	function adoptServerCursor(serverNext: number) {
 		if (rt.seqReady) {
 			applySequenceState(reconcileSequenceState(rt.pending, serverNext));
@@ -1510,13 +1512,13 @@ export default function ompDelta(pi: any) {
 
 	async function attachAndStream(): Promise<void> {
 		rt.detaching = false;
-		rt.detached = false; // 重新附着:清除显式 detach 标记,指示恢复展示
+		rt.detached = false; // re-attaching: clear the explicit detach marker so the indicator shows again
 		const ref = String(rt.worktreeRef ?? "");
-		if (!ref) throw new Error("缺少 worktree reference,请重新 /delta-share。");
+		if (!ref) throw new Error("Missing worktree reference; run /delta-share again.");
 		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		let a = a0;
-		// 新线程的 history/worktree 供给需要数秒到数分钟;这些签名都可退避重试:
-		// not in this account / invalid_reference(服务端还没见到线程)、history is unavailable(供给窗口)
+		// A new thread's history/worktree provisioning takes seconds to minutes; all these signatures are retryable with backoff:
+		// not in this account / invalid_reference (the server hasn't seen the thread yet), history is unavailable (provisioning window)
 		for (let i = 0; a.code !== 0 && i < 20; i++) {
 			const blob = String(a.err || a.out);
 			if (!/not in this account|invalid_reference|history is unavailable|not_visible/i.test(blob)) break;
@@ -1526,13 +1528,13 @@ export default function ompDelta(pi: any) {
 			});
 			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		}
-		// 重连场景:线程已挂过同一 checkout 时 attach 报错,但挂载关系仍在,直接复用
+		// Reconnect case: when the thread already carries this checkout, attach errors, but the mount relation persists — reuse it directly
 		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
-			throw new Error("worktree attach 失败: " + String(a.err || a.out).slice(0, 300));
+			throw new Error("worktree attach failed: " + String(a.err || a.out).slice(0, 300));
 		}
 
-		// mount 上传 checkout 并持续同步;ready 行出现即继续,进程保持运行
-		// 重连/换线程时先杀旧 mount(同 startWatch 对 watch 的处理),防孤儿同步进程双写
+		// mount uploads the checkout and keeps syncing; continue once the ready line appears, the process keeps running.
+		// On reconnect/thread switch, kill the old mount first (as startWatch does for watch) to prevent orphan sync processes double-writing
 		killChild(rt.mountChild);
 		await new Promise<void>((resolveMount) => {
 			let settled = false;
@@ -1548,11 +1550,11 @@ export default function ompDelta(pi: any) {
 				(code) => {
 					rt.mountChild = null;
 					if (!rt.detaching && rt.connected) {
-						notify("Delta worktree 同步进程退出(exit " + code + ")。", "warning");
+						notify("Delta worktree sync process exited (exit " + code + ").", "warning");
 					}
 				},
 			);
-			// mount 启动慢时不无限等;进程仍在后台,就绪后会自行上传
+			// Don't wait forever for a slow mount start; the process stays in the background and uploads by itself once ready
 			schedule(() => settle(), MOUNT_READY_TIMEOUT_MS);
 		});
 
@@ -1560,59 +1562,59 @@ export default function ompDelta(pi: any) {
 		rt.connectAttempts = 0;
 		startWatch();
 		void flush();
-		paintStatus(); // connect:supplying/synced 起点确认/清除 offline
+		paintStatus(); // connect: confirms/clears offline at the supplying/synced starting point
 	}
 
-	/** 合约握手(share 与 join 共用):CLI 支持区间必须与本插件实现区间有交集。 */
+	/** Contract handshake (shared by share and join): the CLI's supported range must intersect what this plugin implements. */
 	async function ensureContractCompatible(): Promise<void> {
 		const contract = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
 		const min = Number(contract?.min ?? 0);
 		const max = Number(contract?.max ?? 0);
 		if (max < CONTRACT_MIN) {
-			throw new Error("delta CLI 过旧(支持合约 " + min + "-" + max + ",需要 ≥ " + CONTRACT_MIN + "),请更新 Delta。");
+			throw new Error("delta CLI is too old (supports contract " + min + "-" + max + ", need ≥ " + CONTRACT_MIN + "); please update Delta.");
 		}
 		if (min > CONTRACT_MAX) {
-			throw new Error("delta CLI 合约更新(min " + min + "),请更新 omp-delta 插件。");
+			throw new Error("delta CLI contract is newer (min " + min + "); please update the omp-delta plugin.");
 		}
 	}
 
-	/** git checkout 预检(share 与 join 共用):worktree 挂载需要 git checkout + remote,提前报错更可读。 */
+	/** git checkout preflight (shared by share and join): worktree mounting needs a git checkout + remote; erroring early reads better. */
 	function assertGitCheckout(): void {
 		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rt.cwd, windowsHide: true });
 		if (g.status !== 0) {
-			throw new Error("当前目录不是 git 仓库,worktree 无法挂载:" + rt.cwd);
+			throw new Error("The current directory is not a git repository; worktree cannot mount: " + rt.cwd);
 		}
 		const remotes = spawnSync("git", ["remote"], { cwd: rt.cwd, windowsHide: true, encoding: "utf8" });
 		if (!String(remotes.stdout ?? "").trim()) {
-			throw new Error("仓库没有 Git remote,Delta worktree 创建会失败:先 git remote add origin …");
+			throw new Error("The repository has no Git remote; Delta worktree creation would fail: run git remote add origin … first");
 		}
 	}
 
-	/** 当前 checkout 的 worktree 身份(share 与 join 共用,参考 delta-claude checkoutReference 语义):
-	 *  list 优先复用同 checkout 的既有身份,不盲目 create;多个身份报歧义让人选。
-	 *  join 场景:本地从未作为 worktree 接入时 create 一个新身份,attach 到目标线程 ——
-	 *  线程里由此并存多个参与者的 worktree(Delta 的多 worktree 模型)。 */
+	/** Worktree identity of the current checkout (shared by share and join, following delta-claude's checkoutReference semantics):
+	 *  list prefers reusing an existing identity for the same checkout over blindly creating; multiple identities are reported as ambiguous for a human choice.
+	 *  Join case: when this machine has never joined as a worktree, create a new identity and attach it to the target thread —
+	 *  the thread then carries worktrees from multiple participants side by side (Delta's multi-worktree model). */
 	async function resolveLocalWorktreeRef(): Promise<string> {
 		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
 		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
 		const pick = pickWorktreeForCwd(rows, rt.cwd);
 		if (pick.ambiguous) {
-			throw new Error("该 checkout 存在多个 worktree 身份,请先在 Delta 里选择正确的一个后重试。");
+			throw new Error("Multiple worktree identities exist for this checkout; pick the right one in Delta first, then retry.");
 		}
 		let ref = pick.ref;
 		if (!ref) {
 			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
 			ref = String(w?.reference ?? "");
 		}
-		if (!ref) throw new Error("worktree create/list 均未取得 reference。");
+		if (!ref) throw new Error("Neither worktree create nor list produced a reference.");
 		return ref;
 	}
 
-	/** 绑定标记写入 omp 会话记录(官方 appendEntry:持久化但不进 LLM 上下文);
-	 *  重启后凭它重连,fork 后凭 external_id 不匹配拒绝静默续录;
-	 *  cwd 用于重连时检测跨目录恢复,防把旧线程挂到错误 checkout。
-	 *  join 与 share 写同一种标记:reconnectByIdentity 通用,不发明第二套持久化(#17)。
-	 *  cwdOverride(#22):物化路径写物化目录(而非当前会话目录),重启后在正确目录恢复。 */
+	/** Writes the binding marker into the omp session record (official appendEntry: persisted but outside LLM context);
+	 *  after a restart it drives the reconnect; after a fork, a mismatching external_id refuses to silently continue recording;
+	 *  cwd is used at reconnect to detect cross-directory recovery, preventing an old thread from mounting the wrong checkout.
+	 *  join and share write the same kind of marker: reconnectByIdentity stays generic, no second persistence scheme invented (#17).
+	 *  cwdOverride (#22): the materialization path writes the materialized directory (not the current session directory) so a restart recovers in the right directory. */
 	function persistBinding(cwdOverride?: string) {
 		try {
 			pi?.appendEntry?.(MARKER_TYPE, {
@@ -1621,17 +1623,17 @@ export default function ompDelta(pi: any) {
 				cwd: cwdOverride ?? rt.cwd,
 			});
 		} catch {
-			/* 标记失败不影响本次连接;下次需手动 /delta-share 或 /delta-join */
+			/* marker failure doesn't affect this connection; next time needs a manual /delta-share or /delta-join */
 		}
 	}
 
-	/** 首次连接:合约协商 → 建线程(幂等)→ worktree → 开始记录。组织由调用方先解析好。 */
+	/** First connect: contract negotiation → create thread (idempotent) → worktree → start recording. The org is resolved by the caller beforehand. */
 	async function connectShared(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
 		await ensureContractCompatible();
 		assertGitCheckout();
 
-		// 组织已在命令处理器里确认对话框之前解析(resolveOrg),这里直接使用
-		// 同 source + external-id 幂等:重试/崩溃恢复都安全
+		// The org was resolved before the consent dialog in the command handler (resolveOrg); use it directly here.
+		// Same source + external-id is idempotent: safe for retries/crash recovery
 		const created = await runDeltaJson(
 			[
 				"thread",
@@ -1647,15 +1649,15 @@ export default function ompDelta(pi: any) {
 			],
 			{ cwd: rt.cwd },
 		);
-		// 身份与游标:thread create 幂等(source+external-id 相同即同一线程)。
-		// status 在供给窗口期可能 not_visible:此时按全新线程处理(seq 从 0),
-		// 让首条记录先上服务端撑开 history 容器 —— 等容器打开后,后续连接的
-		// reconcile 会以服务端游标为准校正。不能让 status 失败阻断首条记录,
-		// 否则空容器永远等不到第一条记录(实测死锁 >90 分钟)。
+		// Identity and cursor: thread create is idempotent (same source+external-id = same thread).
+		// During the provisioning window, status may be not_visible: treat it as a brand-new thread (seq from 0),
+		// letting the first record reach the server and open the history container — once the container opens,
+		// a later connect's reconcile corrects against the server cursor. Don't let a status failure block the first record,
+		// otherwise an empty container waits forever for its first record (observed deadlock >90 minutes).
 		rt.threadId = String(created?.thread_id ?? "");
 		rt.visibility = mode;
 		if (!rt.threadId) {
-			throw new Error("thread create 未返回 thread_id: " + JSON.stringify(created).slice(0, 300));
+			throw new Error("thread create returned no thread_id: " + JSON.stringify(created).slice(0, 300));
 		}
 		let id: DeltaIdentity | null = null;
 		try {
@@ -1665,91 +1667,91 @@ export default function ompDelta(pi: any) {
 			);
 			id = resolveIdentityFromStatus(st);
 		} catch {
-			/* 供给窗口期不可见:按空线程继续 */
+			/* not visible during the provisioning window: continue as an empty thread */
 		}
 		if (id) rt.url = id.url ?? null;
 		adoptServerCursor(id?.nextSequence ?? 0);
 
-		// 立即推首条记录:空线程不会上传服务端,attach/status 会 invalid_reference
+		// Push the first record immediately: an empty thread never reaches the server, and attach/status would invalid_reference
 		if (!rt.titleSent) {
 			rt.titleSent = true;
 			let title = "";
 			try {
 				title = String((await pi?.getSessionName?.()) ?? "");
 			} catch {
-				/* 无会话名 */
+				/* no session name */
 			}
 			emit({ sessionUpdate: "session_info_update", title: (title || "omp session").slice(0, 120) });
 		}
 
-		// worktree 身份:复用同 checkout 的既有身份或新建(见 resolveLocalWorktreeRef)
+		// worktree identity: reuse the existing identity for this checkout or create one (see resolveLocalWorktreeRef)
 		rt.worktreeRef = await resolveLocalWorktreeRef();
 
 		await attachAndStream();
 
 		persistBinding();
 
-		notify(
-			"Delta 线程已连接:" +
-				rt.threadId +
-				"\n浏览器打开: " +
-				(rt.url ?? "https://delta.dev/join/" + rt.threadId) +
-				"\n(对话与工作区文件,含未提交改动,正在同步到 Delta)",
-		);
+			notify(
+				"Delta thread connected: " +
+					rt.threadId +
+					"\nOpen in browser: " +
+					(rt.url ?? "https://delta.dev/join/" + rt.threadId) +
+					"\n(conversation and workspace files, including uncommitted changes, are syncing to Delta)",
+			);
 	}
 
-	/** 后台重试连接(供给窗口期实测可达 10+ 分钟,预算 40×30s)。failLabel:/delta-share 用默认重连文案,
-	 *  #21 自动连接传自己的失败前缀。 */
+	/** Background connect retry (the provisioning window has been observed at 10+ minutes; budget 40×30s). failLabel: /delta-share uses the default reconnect wording;
+	 *  #21 auto-connect passes its own failure prefix. */
 	async function retryConnect(
 		mode: "private" | "organization",
 		org: { id: string; name: string },
-		failLabel = "Delta 重连失败",
+		failLabel = "Delta reconnect failed",
 	): Promise<void> {
-		try {
-			await connectShared(mode, org);
-		} catch (e) {
-			const msg = String(e instanceof Error ? e.message : e);
-			if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
-				rt.connectAttempts += 1;
-				if (rt.connectAttempts % 5 === 0)
-					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+	try {
+		await connectShared(mode, org);
+	} catch (e) {
+		const msg = String(e instanceof Error ? e.message : e);
+		if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
+			rt.connectAttempts += 1;
+			if (rt.connectAttempts % 5 === 0)
+				notify("Delta provisioning window, waiting (retry " + rt.connectAttempts + "): " + msg);
 				paintStatus();
 				schedule(() => {
 					void retryConnect(mode, org, failLabel);
 				}, 30_000);
 				return;
 			}
-			rt.expectingIdentity = false; // 确定性失败:不再让记录滞留临时队列(auto-connect 路径需要;share 路径本就为 false)
-			notify(failLabel + ":" + msg, "warning");
-			paintStatus(); // 重连链终结:decisive 失败 → offline/detached
+			rt.expectingIdentity = false; // decisive failure: stop stranding records in the temporary queue (needed on the auto-connect path; share path is already false)
+			notify(failLabel + ": " + msg, "warning");
+			paintStatus(); // reconnect chain ends: decisive failure → offline/detached
 		}
 	}
 
-	/** #21:仓库策略存的组织 id(delta-claude 存 team.id 同构)。名字仅展示用;
-	 *  org list 可解析时校验 id 在账号名下,避免把确定性失败(组织不在账号里)送进供给窗口重试循环。 */
+	/** #21: the org id stored by the repo policy (delta-claude stores team.id, isomorphic). The name is display-only;
+	 *  when org list is parseable, validate that the id belongs to this account, avoiding sending a decisive failure (org not in the account) into the provisioning-window retry loop. */
 	async function resolveStoredOrg(organizationId: string): Promise<{ id: string; name: string }> {
 		const r = await runDelta(["org", "list"]);
 		const combined = r.out + "\n" + r.err;
 		if (isUnauthenticatedText(combined)) throw new Error(ORG_UNAUTH_HINT);
 		const orgs = parseOrgListFromText(combined);
-		if (orgs === null) return { id: organizationId, name: organizationId }; // 无载荷:交给 connectShared 报具体错误
+		if (orgs === null) return { id: organizationId, name: organizationId }; // no payload: let connectShared report the specific error
 		const hit = orgs.find((o) => o.id === organizationId);
-		if (!hit) throw new Error("仓库策略指向的组织 " + organizationId + " 不在当前账号的组织列表;请运行 /delta-setup 重新选择。");
+		if (!hit) throw new Error("The org " + organizationId + " pointed to by the repo policy is not in this account's org list; run /delta-setup to choose again.");
 		return { id: hit.id, name: hit.name || hit.id };
 	}
 
-	/** #21:仓库策略自动连接(仅后台调用:marker 重连与 checkout 发现都未命中才走到这里)。
-	 *  失败语义与 /delta-share 相同:供给窗口走既有 retryConnect 退避,确定性失败只警告;
-	 *  自身绝不抛出,不影响 session_start 的 30s 预算(整段在后台 IIFE 里)。 */
+	/** #21: repo-policy auto-connect (called from the background only: reached when both marker reconnect and checkout discovery missed).
+	 *  Failure semantics identical to /delta-share: provisioning window goes through the existing retryConnect backoff, decisive failures only warn;
+	 *  it never throws itself, and does not touch session_start's 30s budget (the whole thing runs in a background IIFE). */
 	async function autoConnect(mode: "private" | "organization", organizationId: string): Promise<void> {
-		if (rt.connected || rt.threadId) return; // 手动 /delta-share 等路径已抢先:幂等 create 也会撞同一线程,直接让位
-		notify("仓库策略 " + (mode === "private" ? "private" : "organization") + ":自动连接 Delta…");
+		if (rt.connected || rt.threadId) return; // a manual /delta-share path already won: the idempotent create would hit the same thread; defer to it
+		notify("Repo policy " + (mode === "private" ? "private" : "organization") + ": auto-connecting Delta…");
 		let org: { id: string; name: string };
 		try {
 			org = await resolveStoredOrg(organizationId);
 		} catch (e) {
 			rt.expectingIdentity = false;
-			notify("Delta 自动连接失败:" + String(e instanceof Error ? e.message : e), "warning");
+			notify("Delta auto-connect failed: " + String(e instanceof Error ? e.message : e), "warning");
 			return;
 		}
 		try {
@@ -1759,23 +1761,23 @@ export default function ompDelta(pi: any) {
 			if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
 				rt.connectAttempts += 1;
 				if (rt.connectAttempts === 1 || rt.connectAttempts % 5 === 0)
-					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+					notify("Delta provisioning window, waiting (retry " + rt.connectAttempts + "): " + msg);
 				schedule(() => {
-					void retryConnect(mode, org, "Delta 自动连接失败");
+					void retryConnect(mode, org, "Delta auto-connect failed");
 				}, 30_000);
-				return; // 供给窗口:expectingIdentity 保持,记录继续入临时队列
+				return; // provisioning window: keep expectingIdentity, records keep queueing in the temporary queue
 			}
 			rt.expectingIdentity = false;
-			notify("Delta 自动连接失败:" + msg + "(可用 /delta-share 手动连接)", "warning");
+			notify("Delta auto-connect failed: " + msg + " (/delta-share can connect manually)", "warning");
 		}
 	}
 
-	/** /delta-join 身份解析前门(#17):CLI 的 `thread status` 统一吃 join 链接
-	 *  (https/delta://)、thread_ 分享 id 和线程 id(实测三种形态全部直达同一线程),
-	 *  返回 thread_id、worktree 列表与本 producer 游标(游标按 per-producer 隔离,
-	 *  adoptServerCursor 让本会话从“现在”开始跟,不回放他人历史)。
-	 *  用 runDelta 保留原文:失败分类需要原文匹配(isUnauthenticatedText / not_visible 签名),
-	 *  runDeltaJson 会把原文折叠进错误消息导致分类失效。 */
+	/** Front door for join identity resolution (#17): the CLI's `thread status` uniformly accepts join links
+	 *  (https/delta://), thread_ share ids, and thread ids (all three reach the same thread, as observed),
+	 *  returning thread_id, the worktree list, and this producer's cursor (cursors are per-producer isolated;
+	 *  adoptServerCursor makes this session follow from "now", not replay others' history).
+	 *  Uses runDelta to keep the raw text: failure classification needs raw-text matching (isUnauthenticatedText / not_visible signatures);
+	 *  runDeltaJson folds the raw text into an error message, which would break classification. */
 	async function resolveJoinedIdentity(target: ResolvableJoinTarget): Promise<DeltaIdentity> {
 		const r = await runDelta(
 			["thread", "status", target.raw, "--source", SOURCE, "--external-id", rt.sid],
@@ -1786,46 +1788,46 @@ export default function ompDelta(pi: any) {
 			const kind = classifyJoinFailure(blob);
 			if (kind === "unauthenticated") throw new Error(ORG_UNAUTH_HINT);
 			if (kind === "account-mismatch") throw new Error(JOIN_MISMATCH_HINT);
-			throw new Error("thread status 失败(code " + r.code + "): " + (r.err || r.out).slice(0, 300));
+			throw new Error("thread status failed (code " + r.code + "): " + (r.err || r.out).slice(0, 300));
 		}
 		const id = resolveIdentityFromStatus(runDeltaJsonFromText(r.out, r.err));
 		if (!id) {
-			throw new Error("thread status 未返回 thread_id: " + (r.out || r.err).slice(0, 300));
+			throw new Error("thread status returned no thread_id: " + (r.out || r.err).slice(0, 300));
 		}
 		return id;
 	}
 
-	/** 设置 join 后的线程身份字段(weak 与 materialize 共用)。
-	 *  加入不抢标题:joined 线程的标题属于创建者;置位以抑制 input 处理器的首条 title 记录。 */
+	/** Sets the thread identity fields after a join (shared by weak and materialize).
+	 *  Joining never steals the title: a joined thread's title belongs to its creator; setting the flag suppresses the input handler's first title record. */
 	function adoptJoinedIdentity(id: DeltaIdentity) {
 		rt.threadId = id.threadId;
 		rt.url = id.url || null;
 		rt.visibility = id.visibility ?? null;
 		rt.titleSent = true;
-		// 服务端游标为权威:join 期间可能已有记录在临时队列(expectingIdentity),统一对齐续接;
-		// 之后 flush 直连该线程 append,无需等 mount(同 share 的首条记录时序)
+		// The server cursor is authoritative: records may already sit in the temporary queue during the join (expectingIdentity); align and continue uniformly;
+		// afterwards flush appends straight to that thread without waiting for mount (same first-record timing as share)
 		adoptServerCursor(id.nextSequence);
 	}
 
-	/** weak join 尾段(#17):挂当前 checkout —— worktree 解析 → attach → mount → watch。
-	 *  前置条件:调用方已确认当前目录就是想挂的 checkout(weak join 语义)。 */
+	/** Weak join tail (#17): attach the current checkout — worktree resolution → attach → mount → watch.
+	 *  Precondition: the caller has confirmed the current directory is the checkout to attach (weak join semantics). */
 	async function attachJoined(id: DeltaIdentity): Promise<void> {
 		adoptJoinedIdentity(id);
 		rt.worktreeRef = await resolveLocalWorktreeRef();
 		await attachAndStream();
 		persistBinding();
 		notify(
-			"已加入 Delta 线程:" + rt.threadId +
-				"\n浏览器打开: " + (rt.url ?? "(链接尚未获取,重连后自动更新)") +
-				"\n(当前 checkout 与后续对话正在同步到该线程;退出用 /delta-detach)",
+			"Joined Delta thread: " + rt.threadId +
+				"\nOpen in browser: " + (rt.url ?? "(link not fetched yet; updates automatically after reconnect)") +
+				"\n(the current checkout and future conversation are syncing to that thread; use /delta-detach to exit)",
 		);
 	}
 
-	/** worktree mount 物化(#22):`worktree mount <ref> <dir>`(不带 --existing-checkout)
-	 *  把共享 checkout 物化到新目录,ready 行为 {"operation":"mounted","reference","directory"}
-	 *  (实测同 --existing-checkout 形状);进程保持运行,持续同步 —— 它就是新目录的 mount 子进程。
-	 *  resolve 的是 ready 行回显的 directory(以服务端登记为准);超时但目录已落盘时
-	 *  按 attachAndStream 的容忍策略继续(进程留在后台);目录未落盘则报错(mount 子进程已退)。 */
+	/** worktree mount materialization (#22): `worktree mount <ref> <dir>` (without --existing-checkout)
+	 *  materializes the shared checkout into a new directory; the ready line is {"operation":"mounted","reference","directory"}
+	 *  (same shape as --existing-checkout, as observed); the process keeps running and syncing — it is the new directory's mount subprocess.
+	 *  What resolves is the directory echoed by the ready line (the server's registration is authoritative); on timeout with the directory on disk,
+	 *  continue with attachAndStream's tolerance (the process stays in the background); if the directory never lands, error out (the mount subprocess has exited). */
 	function materializeCheckout(ref: string, requestedDir: string): Promise<string> {
 		killChild(rt.mountChild);
 		return new Promise<string>((resolve, reject) => {
@@ -1845,25 +1847,25 @@ export default function ompDelta(pi: any) {
 				(code) => {
 					rt.mountChild = null;
 					if (!settled) {
-						finish("", "worktree mount 物化失败(exit " + code + "):" + requestedDir);
+						finish("", "worktree mount materialization failed (exit " + code + "): " + requestedDir);
 					} else if (!rt.detaching && rt.connected) {
-						notify("Delta worktree 同步进程退出(exit " + code + ")。", "warning");
+						notify("Delta worktree sync process exited (exit " + code + ").", "warning");
 					}
 				},
 			);
 			schedule(() => {
 				if (settled) return;
 				if (fs.existsSync(requestedDir)) finish(requestedDir);
-				else finish("", "worktree mount 物化超时(" + Math.round(MOUNT_READY_TIMEOUT_MS / 1000) + "s)且目录未落盘:" + requestedDir);
+				else finish("", "worktree mount materialization timed out (" + Math.round(MOUNT_READY_TIMEOUT_MS / 1000) + "s) and the directory never landed: " + requestedDir);
 			}, MOUNT_READY_TIMEOUT_MS);
 		});
 	}
 
-	/** full join 尾段(#22):物化线程 checkout 到新目录,并把运行时切到该目录。
-	 *  ref 是线程 status 里的既有 worktree(无需再 worktree attach);mount 子进程
-	 *  即物化目录的持续同步。此后 rt.cwd 指向物化目录(绑定标记也写新目录):
-	 *  omp 会话本体要等用户手动 /move 才迁移(自动化待上游 oh-my-pi#17441),
-	 *  但同步/watch/游标不依赖会话 cwd —— /move 后无缝继续,详见 contract-notes。 */
+	/** Full join tail (#22): materialize the thread's checkout into a new directory and switch the runtime to it.
+	 *  ref is an existing worktree from the thread's status (no further worktree attach needed); the mount subprocess
+	 *  is the materialized directory's continuous sync. Afterwards rt.cwd points at the materialized directory (the binding marker is written there too):
+	 *  the omp session itself only migrates when the user runs /move manually (automation pending upstream oh-my-pi#17441),
+	 *  but sync/watch/cursor don't depend on the session cwd — everything continues seamlessly after /move, see contract-notes. */
 	async function materializeJoined(id: DeltaIdentity, ref: string, dir: string): Promise<void> {
 		adoptJoinedIdentity(id);
 		const actual = await materializeCheckout(ref, dir);
@@ -1876,13 +1878,13 @@ export default function ompDelta(pi: any) {
 		void flush();
 		persistBinding(actual);
 		notify(
-			"已物化该线程的 checkout:" + actual +
-				"\n同步进程已启动(持续上传/下载该目录)。" +
-				"\n下一步(需手动;可自动化前需上游 oh-my-pi#17441 支持 agent 调 cd):" +
+			"Materialized the thread's checkout: " + actual +
+				"\nThe sync process has started (continuously uploading/downloading that directory)." +
+				"\nNext step (manual; automation needs upstream oh-my-pi#17441 to let agents call cd):" +
 				"\n  /move " + actual +
-				"\n迁移后线程绑定与服务端游标不变,watch 持续,同步已指向新目录;重启 omp 请在新目录打开。" +
-				"\n线程:" + rt.threadId +
-				"\n浏览器打开: " + (rt.url ?? "(链接尚未获取,重连后自动更新)"),
+				"\nAfter the move, the thread binding and the server cursor are unchanged, watch keeps running, and sync points at the new directory; reopen omp in the new directory after a restart." +
+				"\nThread: " + rt.threadId +
+				"\nOpen in browser: " + (rt.url ?? "(link not fetched yet; updates automatically after reconnect)"),
 		);
 	}
 
@@ -1894,13 +1896,13 @@ export default function ompDelta(pi: any) {
 		killChild(rt.watchChild);
 		rt.watchChild = null;
 		rt.connected = false;
-		paintStatus(); // detach → detached → 清槽(setStatus key → undefined,释放槽位)
-		if (!quiet) notify("已断开 Delta 同步(线程与已上传内容保留)。");
+		paintStatus(); // detach → detached → clear the slot (setStatus key → undefined, releasing it)
+		if (!quiet) notify("Delta sync disconnected (the thread and uploaded content are kept).");
 	}
 
-	/** 慢路径发现:moveOff/fork 后本会话无 marker,改从服务端找"绑定过当前 checkout
-	 *  的最近 omp 线程"(thread list → 逐个 status → worktrees 匹配 cwd)。
-	 *  权威在 DeltaDB,不依赖会话 id 的连续性 —— omp 的 continuation 链对它透明。 */
+	/** Slow-path discovery: after moveOff/fork this session has no marker, so look the server up for "the most recent omp
+	 *  thread that bound this checkout" (thread list → per-thread status → worktrees matched against cwd).
+	 *  Authority is DeltaDB; it doesn't depend on session id continuity — omp's continuation chain is transparent to it. */
 	async function discoverBindingByCheckout(): Promise<{ threadId: string; worktreeRef?: string } | null> {
 		const lr = await runDelta(["thread", "list"], { cwd: rt.cwd });
 		log("discovery: thread list code=" + lr.code + " out[0:180]=" + lr.out.slice(0, 180).replace(/\s+/g, " ") + " err[0:120]=" + lr.err.slice(0, 120).replace(/\s+/g, " "));
@@ -1946,9 +1948,9 @@ export default function ompDelta(pi: any) {
 		return null;
 	}
 
-	/** 凭会话标记重连:status 校验 external_id(防 fork 静默续录)→ 对齐服务端游标 → attach。
-	 *  身份权威在 DeltaDB:status 失败/线程不属于本会话时给明确指引,不静默重建。
-	 *  决定性失败(mismatch/歧义/跨目录)会关闭 expectingIdentity;暂时性错误保留它,记录继续排队。 */
+	/** Reconnect from the session marker: status validates external_id (prevents silent continuation after a fork) → align the server cursor → attach.
+	 *  Identity authority is DeltaDB: on status failure / a thread not belonging to this session, give clear guidance instead of silently recreating.
+	 *  Decisive failures (mismatch/ambiguity/cross-directory) clear expectingIdentity; transient errors keep it and records keep queueing. */
 	async function reconnectByIdentity(marker: {
 		threadId: string;
 		worktreeRef?: string;
@@ -1960,40 +1962,40 @@ export default function ompDelta(pi: any) {
 				{ cwd: rt.cwd },
 			);
 			const id = resolveIdentityFromStatus(st);
-			if (!id) throw new Error("thread status 未返回 thread_id");
-			// 等待 status 期间用户手动 /delta-share 或 /delta-join 已绑定其他线程:
-			// 过期重连就此放弃,不覆盖前台身份(#17 join 让这个交错更常见)
+			if (!id) throw new Error("thread status returned no thread_id");
+			// While waiting for status, the user may have manually /delta-share or /delta-join'd another thread:
+			// an expired reconnect gives up and never overwrites the foreground identity (#17 join makes this interleaving more common)
 			if (rt.threadId && rt.seqReady) {
-				notify("后台重连取消:会话已手动绑定线程 " + rt.threadId + "。");
+				notify("Background reconnect cancelled: the session already manually bound thread " + rt.threadId + ".");
 				rt.expectingIdentity = false;
 				return;
 			}
-			// omp -r 恢复会话会 fork 出新 sid:marker 在、external_id 不同 → 以新 producer
-			// 身份重绑同一线程(per-producer 游标独立,不会重复);无需用户重新 /delta-share。
+			// An omp -r session resume forks a new sid: marker present, external_id different → re-bind the same thread as a new
+			// producer (per-producer cursors are independent, no duplicates); no need for the user to /delta-share again.
 			if (id.externalId && id.externalId !== rt.sid) {
-				notify("会话已分叉(" + id.externalId + " → " + rt.sid + "):以新 producer 续录同一线程。");
+				notify("Session has forked (" + id.externalId + " → " + rt.sid + "): continuing to record the same thread as a new producer.");
 			}
 			rt.threadId = id.threadId;
 			rt.url = id.url || null;
 			rt.visibility = id.visibility ?? null;
 			const pick = pickWorktreeForCwd(id.worktrees, rt.cwd);
 			if (pick.ambiguous) {
-				notify("该线程挂了多个 worktree 身份,请 /delta-share 重新绑定。", "warning");
+				notify("This thread carries multiple worktree identities; please re-bind with /delta-share.", "warning");
 				rt.expectingIdentity = false;
 				paintStatus();
 				return;
 			}
 			let ref = pick.ref;
 			if (!ref) {
-				// status 没列出匹配当前目录的 worktree:标记目录也不同时拒绝,防把旧线程挂到错误 checkout
+				// status listed no worktree matching the current directory: refuse when the marker directory differs too, preventing an old thread from mounting the wrong checkout
 				if (marker.cwd && normPath(marker.cwd) !== normPath(rt.cwd)) {
 					notify(
-						"该 Delta 线程绑定的是 " + marker.cwd + " 的 checkout,当前目录是 " + rt.cwd
-							+ ";请在原目录打开 omp,或重新 /delta-share(旧线程保留在 Delta)。",
+						"This Delta thread is bound to the checkout at " + marker.cwd + ", but the current directory is " + rt.cwd
+							+ "; open omp in the original directory, or /delta-share again (the old thread stays in Delta).",
 						"warning",
 					);
 					rt.expectingIdentity = false;
-					paintStatus(); // decisive 失败:supplying → offline(线程在,连接断)
+					paintStatus(); // decisive failure: supplying → offline (thread exists, connection broken)
 					return;
 				}
 				ref = String(marker.worktreeRef ?? "");
@@ -2001,17 +2003,17 @@ export default function ompDelta(pi: any) {
 			rt.worktreeRef = ref;
 			adoptServerCursor(id.nextSequence);
 			await attachAndStream();
-			notify("Delta 已重连: " + (rt.url ?? rt.threadId));
+			notify("Delta reconnected: " + (rt.url ?? rt.threadId));
 		} catch (e) {
-			// 暂时性错误(含供给窗口):expectingIdentity 保留,记录继续排队;/delta-retry 可再试
-			notify("Delta 重连失败:" + String(e instanceof Error ? e.message : e) + "(/delta-retry 可再试)", "warning");
-			paintStatus(); // 大概率仍是 supplying(expectingIdentity 保留);decisive 失败已在内层清掉并重绘
+			// Transient error (incl. the provisioning window): keep expectingIdentity, records keep queueing; /delta-retry can try again
+			notify("Delta reconnect failed: " + String(e instanceof Error ? e.message : e) + " (/delta-retry can try again)", "warning");
+			paintStatus(); // most likely still supplying (expectingIdentity kept); a decisive failure has already cleared and repainted it in the inner layer
 		}
 	}
 
-	// ---- 事件与命令注册 ----
+	// ---- Event and command registration ----
 
-	// #15:可路由平铺命令的 handler 引用,注册时回填;/delta 路由复用同一函数对象(别名语义由构造保证)
+	// #15: handler references for the routable flat commands, backfilled at registration; the /delta router reuses the same function objects (alias semantics guaranteed by construction)
 	const deltaHandlers: Record<string, (args: string, ctx: any) => Promise<void>> = {};
 	const registerDeltaCommand = (
 		name: string,
@@ -2022,48 +2024,48 @@ export default function ompDelta(pi: any) {
 	};
 
 	registerDeltaCommand("delta-share", {
-		description: "把当前 omp 会话连接到 Delta 线程(无参数:交互选择可见性;private 参数:直接私有;非交互环境默认共享给组织)",
+		description: "Connect the current omp session to a Delta thread (no argument: interactive visibility picker; 'private' argument: private directly; non-interactive environments default to sharing with the org)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
-			rt.cwd = String(ctx?.cwd ?? rt.cwd); // omp 的 /cd 会改会话 cwd,连接前以当前值为准
+			rt.cwd = String(ctx?.cwd ?? rt.cwd); // omp's /cd changes the session cwd; use the current value before connecting
 			if (rt.isSub) {
-				notify("子代理会话暂不支持连接 Delta。", "warning");
+				notify("Subagent sessions cannot connect to Delta yet.", "warning");
 				return;
 			}
 			if (rt.connected) {
-				notify("已连接:" + rt.threadId);
+				notify("Already connected: " + rt.threadId);
 				return;
 			}
-			// 合约要求：共享前必须征得用户同意，并告知可见范围（组织名+内容）
+			// Contract requirement: obtain user consent before sharing, and disclose the visibility scope (org name + content)
 			let ok = true;
 			let org: { id: string; name: string };
-			let mode: "private" | "organization" = "organization"; // 兜底默认;显式参数或选择器会覆盖
+			let mode: "private" | "organization" = "organization"; // fallback default; explicit arguments or the picker override it
 			try {
 				org = await resolveOrg();
-				// 可见性(#16):显式参数直达旧行为;无参数先弹选择器(私有 vs 组织),再走同一个确认+连接路径
+				// Visibility (#16): explicit arguments go straight to the old behavior; with no argument, show the picker (private vs. organization) first, then the same confirm+connect path
 				const pick = await pickShareVisibility(args, ctx?.ui, org);
 				if (pick.mode === null) {
-					notify("已取消,未创建 Delta 线程。");
+					notify("Cancelled; no Delta thread created.");
 					return;
 				}
 				if (pick.fallback) notify(pick.fallback, "warning");
 				mode = pick.mode;
 				if (typeof ctx?.ui?.confirm === "function") {
 					ok = await ctx.ui.confirm(
-						mode === "private" ? "连接 Delta（私有线程）？" : "连接 Delta 并把会话共享给组织？",
+						mode === "private" ? "Connect Delta (private thread)?" : "Connect Delta and share this session with the org?",
 						mode === "private"
-							? "可见性：私有，仅你自己可见\n共享内容：对话记录与工作区文件，含未提交改动"
-							: "组织：" + org.name + "（" + org.id + "）\n共享内容：对话记录与工作区文件，含未提交改动",
+							? "Visibility: private, visible only to you\nShared content: conversation and workspace files, including uncommitted changes"
+							: "Org: " + org.name + " (" + org.id + ")\nShared content: conversation and workspace files, including uncommitted changes",
 					);
 				} else {
-					notify(mode === "private" ? "将创建私有线程。" : "将共享到组织：" + org.name);
+					notify(mode === "private" ? "A private thread will be created." : "Will share with org: " + org.name);
 				}
 				if (!ok) {
-					notify("已取消，未创建 Delta 线程。");
+					notify("Cancelled; no Delta thread created.");
 					return;
 				}
 			} catch (e) {
-				notify("准备连接失败：" + String(e instanceof Error ? e.message : e), "warning");
+				notify("Preparing the connection failed: " + String(e instanceof Error ? e.message : e), "warning");
 				return;
 			}
 			try {
@@ -2073,52 +2075,52 @@ export default function ompDelta(pi: any) {
 				if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
 					rt.connectAttempts += 1;
 					if (rt.connectAttempts === 1 || rt.connectAttempts % 5 === 0)
-						notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
-					paintStatus(); // 后台重连窗口 → supplying
+						notify("Delta provisioning window, waiting (retry " + rt.connectAttempts + "): " + msg);
+					paintStatus(); // background reconnect window → supplying
 					schedule(() => {
 						void retryConnect(mode, org);
 					}, 30_000);
 					return;
 				}
-				notify("连接失败:" + msg, "warning");
-				paintStatus(); // decisive 失败:回到 detached/offline
+				notify("Connection failed: " + msg, "warning");
+				paintStatus(); // decisive failure: back to detached/offline
 			}
 		},
 	});
 
 	registerDeltaCommand("delta-join", {
-		description: "加入已有 Delta 线程(接受 https://delta.dev/join/…、delta://join/…、thread_ 分享 id 或线程 id;默认挂载当前 checkout;--move 或 --into <绝对路径> 改为物化线程 checkout 到新目录并指引 /move)",
+		description: "Join an existing Delta thread (accepts https://delta.dev/join/…, delta://join/…, a thread_ share id, or a thread id; attaches the current checkout by default; --move or --into <abs-dir> instead materializes the thread's checkout into a new directory and guides /move)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			if (rt.isSub) {
-				notify("子代理会话暂不支持连接 Delta。", "warning");
+				notify("Subagent sessions cannot connect to Delta yet.", "warning");
 				return;
 			}
 			if (rt.connected) {
-				notify("已连接:" + rt.threadId + ";如需换线程,先 /delta-detach 再 /delta-join。");
+				notify("Already connected: " + rt.threadId + "; to switch threads, /delta-detach first, then /delta-join.");
 				return;
 			}
 			const inv = parseJoinInvocation(args);
 			if (inv.into !== null && !inv.into) {
-				notify("--into 需要一个绝对路径:/delta-join <link|id> --into <dir>。", "warning");
+				notify("--into needs an absolute path: /delta-join <link|id> --into <dir>.", "warning");
 				return;
 			}
 			if (inv.into !== null && !path.isAbsolute(inv.into)) {
-				notify("--into 需要绝对路径(物化目录不能依赖会话 cwd):" + inv.into, "warning");
+				notify("--into needs an absolute path (the materialized directory cannot depend on the session cwd): " + inv.into, "warning");
 				return;
 			}
 			if (inv.target.kind === "empty") {
-				notify("用法:/delta-join <link|id> [--move] [--into <dir>]\n目标接受 delta.dev join 链接、thread_ 分享 id 或线程 id;--move(或 --into)物化线程 checkout 到新目录并指引 /move。", "warning");
+				notify("Usage: /delta-join <link|id> [--move] [--into <dir>]\nThe target accepts a delta.dev join link, a thread_ share id, or a thread id; --move (or --into) materializes the thread's checkout into a new directory and guides /move.", "warning");
 				return;
 			}
 			if (inv.target.kind === "invalid") {
-				notify("无法识别的 join 目标:" + inv.target.raw + "\n请粘贴完整 join 链接(https://delta.dev/join/… 或 delta://join/…)或线程 id。", "warning");
+				notify("Unrecognized join target: " + inv.target.raw + "\nPaste a full join link (https://delta.dev/join/… or delta://join/…) or a thread id.", "warning");
 				return;
 			}
 			try {
 				await ensureContractCompatible();
-				// git 预检只属于 weak join(物化路径的当前目录不必是 git checkout,#22)
+				// The git preflight belongs to weak join only (the materialization path's current directory need not be a git checkout, #22)
 				if (!inv.move && inv.into === null) assertGitCheckout();
 			} catch (e) {
 				notify(String(e instanceof Error ? e.message : e), "warning");
@@ -2127,11 +2129,11 @@ export default function ompDelta(pi: any) {
 			try {
 				const id = await resolveJoinedIdentity(inv.target);
 				const pick = pickMaterializeCandidate(id.worktrees, rt.cwd);
-				const what = inv.target.kind === "link" || inv.target.kind === "share-id" ? "分享 id " + inv.target.shareId : "线程 " + inv.target.raw;
-				const explicit = inv.move || inv.into !== null; // --into 隐含 --move;显式参数即知情(同 share 显式参数直达的先例)
+				const what = inv.target.kind === "link" || inv.target.kind === "share-id" ? "share id " + inv.target.shareId : "thread " + inv.target.raw;
+				const explicit = inv.move || inv.into !== null; // --into implies --move; explicit arguments imply informed consent (same precedent as share's explicit arguments)
 				if (explicit && pick.kind === "local" && pick.cwdMatch) {
-					// --move 但已经在 checkout 里:物化无意义,走 weak join(仍征同意,同 share 恒确认)
-					notify("当前目录已是该线程的 checkout,直接挂载(无需物化)。");
+					// --move while already inside the checkout: materialization is pointless, go weak join (still consented, same as share's constant confirm)
+					notify("The current directory is already this thread's checkout; attaching directly (no materialization needed).");
 					if (!(await confirmWeakJoin(ctx, what))) return;
 					await attachJoined(id);
 				} else if (explicit) {
@@ -2140,62 +2142,62 @@ export default function ompDelta(pi: any) {
 					if (!(await confirmWeakJoin(ctx, what))) return;
 					await attachJoined(id);
 				} else {
-					// 默认 weak join;线程 checkout 不在当前目录时先给一次物化选择,绝不静默挂错目录(#22)
+					// Default weak join; when the thread's checkout isn't the current directory, offer materialization once first, never silently attach to the wrong directory (#22)
 					let offered = false;
 					if (pick.kind === "local" && typeof ctx?.ui?.confirm === "function") {
 						offered = true;
 						const ok = await ctx.ui.confirm(
-							"该线程的 checkout 不在当前目录,要物化一份到新目录吗？",
-							"本机已有:" + pick.dirs.slice(0, 3).join("; ") +
-								"\n确认 = 物化到新目录并给出 /move 指引" +
-								"\n取消 = 照旧挂载当前目录(weak join)",
+							"The thread's checkout is not the current directory; materialize a copy into a new directory?",
+							"Already on this machine: " + pick.dirs.slice(0, 3).join("; ") +
+								"\nConfirm = materialize into a new directory and print /move guidance" +
+								"\nCancel = attach the current directory as usual (weak join)",
 						);
 						if (ok) {
 							await joinWithMaterialize(id, pick, inv);
 							return;
 						}
 					} else if (pick.kind !== "local" && pick.kind !== "empty") {
-						notify("该线程的 checkout 不在本机;/delta-join … --move 可物化到新目录并指引 /move。");
+						notify("The thread's checkout is not on this machine; /delta-join … --move can materialize it into a new directory and guide /move.");
 					} else if (pick.kind === "local") {
-						notify("当前目录不是该线程的 checkout(本机已有: " + pick.dirs.slice(0, 3).join("; ") + ");将照旧挂载当前目录。");
+						notify("The current directory is not the thread's checkout (already on this machine: " + pick.dirs.slice(0, 3).join("; ") + "); attaching the current directory as usual.");
 					}
-					// 物化询问的取消文案已明示“照旧挂载”,不再二次确认
+					// The materialization prompt's cancel text already says "attach as usual"; no second confirm
 					if (!offered && !(await confirmWeakJoin(ctx, what))) return;
 					await attachJoined(id);
 				}
 			} catch (e) {
-				// join 的供给窗口与 share 不同源:线程是别人创建的,不自动后台重试(share 的
-				// retryConnect 语义绑定 connectShared);账号不匹配的提示已含重试指引。
-				// 撤销 title 抑制:加入失败后,后续 /delta-share 仍应发首条 title
+				// join's provisioning window differs from share's: the thread was created by someone else, so no automatic background retry (share's
+				// retryConnect semantics are bound to connectShared); the account-mismatch hint already carries retry guidance.
+				// Undo the title suppression: after a failed join, a later /delta-share should still send the first title
 				rt.titleSent = false;
-				notify("加入失败:" + String(e instanceof Error ? e.message : e), "warning");
+				notify("Join failed: " + String(e instanceof Error ? e.message : e), "warning");
 			}
 		},
 	});
 
-	/** weak join 的合约同意(#17 沿用):共享内容(含未提交改动)进入线程前征得同意;
-	 *  非交互环境沿用 share 的回落(告知后继续)。 */
+	/** Contract consent for weak join (carried over from #17): get consent before shared content (incl. uncommitted changes) enters the thread;
+	 *  non-interactive environments reuse share's fallback (inform, then continue). */
 	async function confirmWeakJoin(ctx: any, what: string): Promise<boolean> {
 		if (typeof ctx?.ui?.confirm === "function") {
 			const ok = await ctx.ui.confirm(
-				"加入该 Delta 线程并把当前 checkout 挂上去？",
-				"目标:" + what + "\n共享内容:对话记录与工作区文件,含未提交改动",
+				"Join this Delta thread and attach the current checkout?",
+				"Target: " + what + "\nShared content: conversation and workspace files, including uncommitted changes",
 			);
 			if (!ok) {
-				notify("已取消,未加入线程。");
+				notify("Cancelled; thread not joined.");
 				return false;
 			}
 			return true;
 		}
-		notify("将加入目标线程并挂载当前 checkout(含未提交改动)。");
+		notify("Will join the target thread and attach the current checkout (including uncommitted changes).");
 		return true;
 	}
 
-	/** join 的物化分支(#22):决定物化目标与 ref 后走 materializeJoined。
-	 *  pick.local 且 cwdMatch → 不物化(已在 checkout 里);local 他处 → 用第一个条目的 ref
-	 *  再物化一份;ambiguous/empty 的错误见 pickMaterializeCandidate。物化目录:
-	 *  --into 显式指定,否则由线程标题/分享 id 推导(当前目录同级);已存在则要求 --into。
-	 *  consent 已由调用方完成(显式 --move/--into,或物化询问的确认)。 */
+	/** join's materialization branch (#22): decide the materialization target and ref, then go through materializeJoined.
+	 *  pick.local with cwdMatch → no materialization (already inside the checkout); local elsewhere → re-materialize a fresh copy using
+	 *  the first entry's ref; ambiguous/empty errors come from pickMaterializeCandidate. Materialized directory:
+	 *  --into when given explicitly, otherwise derived from the thread title/share id (a sibling of the current directory); if it exists, --into is required.
+	 *  Consent has already been obtained by the caller (explicit --move/--into, or the materialization prompt's confirm). */
 	async function joinWithMaterialize(
 		id: DeltaIdentity,
 		pick: MaterializePick,
@@ -2203,102 +2205,102 @@ export default function ompDelta(pi: any) {
 	): Promise<void> {
 		let ref: string;
 		if (pick.kind === "ref" || pick.kind === "local") {
-			// local 只可能是“本机他处”(cwdMatch 已在 handler 里拦下):显式要求下,用
-			// 第一个条目的 ref 再物化一份新目录
+			// local can only be "elsewhere on this machine" (cwdMatch was intercepted in the handler): under an explicit request, use
+			// the first entry's ref to materialize a fresh copy into a new directory
 			ref = pick.ref;
 		} else if (pick.kind === "ambiguous") {
 			throw new Error(
-				"该线程有多个不在本机的 worktree,无法确定要物化哪一个:\n  " +
+				"This thread has several worktrees not on this machine; cannot determine which to materialize:\n  " +
 					pick.refs.map((r) => r.slice(0, 60)).join("\n  ") +
-					"\n请在正确的 checkout 目录里 weak join,或联系线程创建者确认。",
+					"\nWeak join from the correct checkout directory, or ask the thread's creator to confirm.",
 			);
 		} else {
-			throw new Error("该线程没有任何 worktree 可物化;请让创建者先挂载 checkout,或在你的 checkout 目录里 weak join。");
+			throw new Error("This thread has no worktree to materialize; ask the creator to mount the checkout first, or weak join from your checkout directory.");
 		}
 		const seed = id.title || (inv.target.kind === "link" || inv.target.kind === "share-id" ? inv.target.shareId : "") || id.threadId;
 		const dir = inv.into ?? deriveMaterializeDir(rt.cwd, seed);
 		if (fs.existsSync(dir)) {
-			throw new Error("物化目录已存在:" + dir + ";请用 --into <绝对路径> 指定一个不存在的目录。");
+			throw new Error("The materialization directory already exists: " + dir + "; use --into <abs-path> to name a directory that doesn't exist.");
 		}
 		await materializeJoined(id, ref, dir);
 	}
 
 	registerDeltaCommand("delta-status", {
-		description: "查看 omp-delta 连接与同步状态",
+		description: "Show omp-delta connection and sync status",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
-			// #21:仓库策略一行展示,让"为什么自动连接了/没连"可见
+			// #21: show the repo policy on one line, making "why did/didn't it auto-connect" visible
 			const policyRoot = gitCheckoutRoot(rt.cwd);
 			const pf = policyRoot ? readRepoPolicyFile(policyRoot) : null;
 			const lines = [
-				"连接: " + (rt.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
-				"线程: " + (rt.threadId ?? "无"),
-				rt.threadId ? "可见性: " + (rt.visibility ?? "未知") : "",
-				rt.threadId ? "链接: " + (rt.url ?? "(尚未获取,重连后自动更新)") : "",
-				"记录: 已分配 " + rt.seq + " 条,已确认 " + rt.lastAcked + " 条,待发 " + rt.pending.length + " 条",
-				"worktree: " + (rt.worktreeRef ?? "无"),
-				"mount/watch: " + (rt.mountChild ? "运行中" : "停止") + " / " + (rt.watchChild ? "运行中" : "停止"),
-				"会话: " + (rt.isSub ? "子代理(不记录)" : "主会话") + " · " + rt.sid,
-				"策略: " + (pf ? renderProjectPolicy(pf.policy) : "无 Git checkout(不适用)"),
+				"Connection: " + (rt.connected ? "connected" : "not connected") + (rt.paused ? " (push paused)" : ""),
+				"Thread: " + (rt.threadId ?? "none"),
+				rt.threadId ? "Visibility: " + (rt.visibility ?? "unknown") : "",
+				rt.threadId ? "Link: " + (rt.url ?? "(not fetched yet; updates automatically after reconnect)") : "",
+				"Records: " + rt.seq + " assigned, " + rt.lastAcked + " acked, " + rt.pending.length + " queued",
+				"worktree: " + (rt.worktreeRef ?? "none"),
+				"mount/watch: " + (rt.mountChild ? "running" : "stopped") + " / " + (rt.watchChild ? "running" : "stopped"),
+				"Session: " + (rt.isSub ? "subagent (not recorded)" : "main") + " · " + rt.sid,
+				"Policy: " + (pf ? renderProjectPolicy(pf.policy) : "no Git checkout (n/a)"),
 			].filter(Boolean);
 			notify(lines.join("\n"));
 		},
 	});
 
 	registerDeltaCommand("delta-setup", {
-		description: "设置本仓库的 Delta 同步策略(.delta/settings.json,兼容 delta-claude):private|organization|manual;无参数交互选择",
+		description: "Set this repo's Delta sync policy (.delta/settings.json, delta-claude compatible): private|organization|manual; no argument opens an interactive picker",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			if (rt.isSub) {
-				notify("子代理会话暂不支持 /delta-setup。", "warning");
+				notify("Subagent sessions cannot use /delta-setup yet.", "warning");
 				return;
 			}
 			const decision = parseSetupModeArg(args);
 			if (decision.kind === "invalid") {
 				notify(
-					"未知模式:" + decision.arg + "\n用法:/delta-setup private|organization|manual(无参数交互选择)。\n" +
-						"private/organization = 新会话自动连接(private 仅自己可见);manual = 仅 /delta-share 手动同步(现状)。",
+					"Unknown mode: " + decision.arg + "\nUsage: /delta-setup private|organization|manual (no argument opens an interactive picker).\n" +
+						"private/organization = auto-connect new sessions (private is visible only to you); manual = /delta-share manual sync only (current behavior).",
 					"warning",
 				);
 				return;
 			}
 			const root = gitCheckoutRoot(rt.cwd);
 			if (!root) {
-				notify("/delta-setup 需要 Git checkout:" + rt.cwd + " 下未找到仓库根。", "warning");
+				notify("/delta-setup needs a Git checkout: no repository root found under " + rt.cwd + ".", "warning");
 				return;
 			}
-			// 读现有文件:未知键整体保留;malformed 不静默覆盖(delta-claude 同样先征求同意)
+			// Read the existing file: unknown keys survive as a whole; never silently overwrite malformed files (delta-claude also asks first)
 			const policyFile = readRepoPolicyFile(root);
 			if (policyFile.malformed) {
 				let replace = false;
 				if (typeof ctx?.ui?.confirm === "function") {
 					try {
 						replace = await ctx.ui.confirm(
-							"替换无法解析的 .delta/settings.json?",
-							(policyFile.policy.problem ?? "文件不是有效 JSON 对象") + "\n替换后原内容丢失;选择取消可先手动修复。",
+							"Replace the unparseable .delta/settings.json?",
+							(policyFile.policy.problem ?? "The file is not a valid JSON object") + "\nThe original content is lost after replacing; choose cancel to fix it manually first.",
 						);
 					} catch {
 						replace = false;
 					}
 				} else {
-					notify(".delta/settings.json 无法解析(" + (policyFile.policy.problem ?? "?") + ");未自动覆盖。请手动修复或删除该文件后重试。", "warning");
+					notify(".delta/settings.json is unparseable (" + (policyFile.policy.problem ?? "?") + "); not overwritten automatically. Fix or delete the file manually, then retry.", "warning");
 					return;
 				}
 				if (!replace) {
-					notify("已取消,.delta/settings.json 保持原样。");
-					return;
+						notify("Cancelled; .delta/settings.json was left untouched.");
+						return;
+					}
 				}
-			}
-			// 组织:private/organization 必须带(delta-claude 语义);显式 manual 不需要,离线也能钉住现状
+				// Org: required for private/organization (delta-claude semantics); explicit manual doesn't need it, so the current state can be pinned offline
 			let org: { id: string; name: string } | null = null;
 			if (!(decision.kind === "set" && decision.mode === "manual")) {
 				try {
 					org = await resolveOrg();
 				} catch (e) {
 					notify(
-						"解析当前组织失败:" + String(e instanceof Error ? e.message : e) +
-							"\nprivate/organization 策略必须带组织;若只想固定手动模式,可运行 /delta-setup manual。",
+						"Resolving the current org failed: " + String(e instanceof Error ? e.message : e) +
+							"\nprivate/organization policies require an org; if you only want to pin manual mode, run /delta-setup manual.",
 						"warning",
 					);
 					return;
@@ -2310,7 +2312,7 @@ export default function ompDelta(pi: any) {
 			} else {
 				const pick = await pickSetupMode(ctx?.ui, org);
 				if (pick.mode === null) {
-					notify("已取消,.delta/settings.json 保持原样。");
+					notify("Cancelled; .delta/settings.json was left untouched.");
 					return;
 				}
 				if (pick.fallback) notify(pick.fallback, "warning");
@@ -2320,29 +2322,29 @@ export default function ompDelta(pi: any) {
 			try {
 				writeRepoPolicyFile(root, text);
 			} catch (e) {
-				notify("写入 .delta/settings.json 失败:" + String(e instanceof Error ? e.message : e), "warning");
+				notify("Failed to write .delta/settings.json: " + String(e instanceof Error ? e.message : e), "warning");
 				return;
 			}
-			// delta-claude 约定:策略是个人选择,进 .git/info/exclude 而不是被跟踪的 .gitignore
+			// delta-claude convention: the policy is a personal choice, so it goes into .git/info/exclude rather than the tracked .gitignore
 			if (!excludeFromGit(root)) {
-				notify("未能把 .delta/settings.json 排除出 Git;若不想提交它,请手动在 .gitignore 加一行:.delta/settings.json", "warning");
+				notify("Could not exclude .delta/settings.json from Git; if you don't want to commit it, add a line to .gitignore manually: .delta/settings.json", "warning");
 			}
-			const label = mode === "private" ? "Private sync(私有)" : mode === "organization" ? "Team sharing(共享给 " + (org?.name ?? "?") + ")" : "Manual(手动)";
+			const label = mode === "private" ? "Private sync (private)" : mode === "organization" ? "Team sharing (shared with " + (org?.name ?? "?") + ")" : "Manual (manual)";
 			notify(
-				"已保存 " + label + " 到 .delta/settings.json。\n" +
+				"Saved " + label + " to .delta/settings.json.\n" +
 					(mode === "manual"
-						? "新会话仅在你运行 /delta-share 时同步。"
-						: "新会话将自动连接 Delta(" + (mode === "private" ? "私有线程" : "共享给组织 " + org!.name) + ");本会话不受影响,现在连接请运行 /delta-share。"),
+						? "New sessions sync only when you run /delta-share."
+						: "New sessions will connect to Delta automatically (" + (mode === "private" ? "private threads" : "shared with org " + org!.name) + "); this session is unaffected — to connect now, run /delta-share."),
 			);
 		},
 	});
 
 	registerDeltaCommand("delta-detach", {
-		description: "断开 Delta 同步(保留线程与已上传内容)",
+		description: "Disconnect Delta sync (the thread and uploaded content are kept)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
 			if (!rt.threadId) {
-				notify("尚未连接 Delta。");
+				notify("Not connected to Delta yet.");
 				return;
 			}
 			detach();
@@ -2350,18 +2352,18 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.registerCommand("delta-org", {
-		description: "查看 Delta 组织(只读):list 列出并标记当前组织;current 显示共享将使用的组织",
+		description: "Inspect Delta orgs (read-only): list shows orgs and marks the current one; current shows the org sharing will use",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			const mode = (String(args ?? "").trim().split(/\s+/)[0] ?? "").toLowerCase() || "list";
 			if (mode !== "list" && mode !== "current") {
-				notify("用法:/delta-org list(列出组织并标记当前)/ /delta-org current(查看共享将使用的组织)。只读命令:切换组织请用 delta org switch。");
+				notify("Usage: /delta-org list (list orgs and mark the current one) or /delta-org current (show the org sharing will use). Read-only: use delta org switch to change orgs.");
 				return;
 			}
 			try {
 				if (mode === "current") {
-					const org = await resolveOrg(); // 与 /delta-share 同一来源:展示共享实际会使用的组织
-					notify("共享将使用的组织:" + org.name + "(" + org.id + ")");
+					const org = await resolveOrg(); // same source as /delta-share: shows the org sharing would actually use
+					notify("Org sharing will use: " + org.name + " (" + org.id + ")");
 					return;
 				}
 				const r = await runDelta(["org", "list"]);
@@ -2369,47 +2371,47 @@ export default function ompDelta(pi: any) {
 				const orgs = parseOrgListFromText(combined);
 				if (!orgs) {
 					notify(
-						isUnauthenticatedText(combined) ? ORG_UNAUTH_HINT : "delta org list 失败(code " + r.code + "):" + (r.err || r.out).slice(0, 200),
+						isUnauthenticatedText(combined) ? ORG_UNAUTH_HINT : "delta org list failed (code " + r.code + "): " + (r.err || r.out).slice(0, 200),
 						"warning",
 					);
 					return;
 				}
-				notify(orgs.length > 0 ? "Delta 组织(" + orgs.length + "):\n" + formatOrgList(orgs) : formatOrgList(orgs));
+				notify(orgs.length > 0 ? "Delta orgs (" + orgs.length + "):\n" + formatOrgList(orgs) : formatOrgList(orgs));
 			} catch (e) {
-				notify("delta org 失败:" + String(e instanceof Error ? e.message : e), "warning");
+				notify("delta org failed: " + String(e instanceof Error ? e.message : e), "warning");
 			}
 		},
 	});
 
 	registerDeltaCommand("delta-retry", {
-		description: "恢复/重试 Delta 推送(断线后也可重连)",
+		description: "Resume/retry Delta push (also reconnects after a disconnect)",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			rt.paused = false;
 			rt.retryAttempts = 0;
-			rt.historyWaitAttempts = 0; // 供给窗口可能超过旧预算:手动重试必须重新武装长预算
+			rt.historyWaitAttempts = 0; // the provisioning window can exceed the old budget: a manual retry must re-arm the long budget
 			rt.connectAttempts = 0;
-			paintStatus(ctx); // 手动重试清除 offline/paused
+			paintStatus(ctx); // a manual retry clears offline/paused
 			if (rt.threadId && !rt.connected) {
-				notify("尝试重连 Delta 线程 " + rt.threadId + " …");
+				notify("Trying to reconnect Delta thread " + rt.threadId + " …");
 				try {
 					await attachAndStream();
-					notify("已重连。");
+					notify("Reconnected.");
 				} catch (e) {
-					notify("重连失败:" + String(e instanceof Error ? e.message : e), "warning");
-					paintStatus(); // 重连失败:线程仍在 → offline
+					notify("Reconnect failed: " + String(e instanceof Error ? e.message : e), "warning");
+					paintStatus(); // reconnect failed: the thread still exists → offline
 					return;
 				}
 			} else if (!rt.threadId) {
-				// 进程重启后内存为空:凭会话标记重连(无标记则提示 /delta-share)
+				// Memory is empty after a process restart: reconnect from the session marker (without one, suggest /delta-share)
 				const marker = findSessionMarker(ctx);
 				if (marker) {
-					notify("凭会话标记重连 Delta 线程 " + marker.threadId + " …");
+					notify("Reconnecting Delta thread " + marker.threadId + " from the session marker …");
 					rt.expectingIdentity = true;
 					await reconnectByIdentity(marker);
 				} else {
-					notify("尚未绑定 Delta 线程;用 /delta-share 连接。");
+					notify("No Delta thread bound yet; connect with /delta-share.");
 				}
 			} else {
 				void flush();
@@ -2418,27 +2420,27 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.registerCommand("delta-update", {
-		description: "检查或安装 Delta 更新(/delta-update check 仅检查不安装);输出含 omp-delta 插件重装提示",
+		description: "Check or install Delta updates (/delta-update check checks without installing); the output carries the omp-delta plugin reinstall hint",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			rt.cwd = String(ctx?.cwd ?? rt.cwd);
 			const mode: "check" | "update" = String(args ?? "").trim().toLowerCase().startsWith("check") ? "check" : "update";
-			notify(mode === "check" ? "正在检查 Delta 更新…" : "正在更新 Delta(下载与安装可能需要几分钟)…");
-			// runDelta 统一加全局 --json:实测 `delta --json update --check` 与 `delta update --check --json` 输出一致
+			notify(mode === "check" ? "Checking for Delta updates…" : "Updating Delta (download and install may take a few minutes)…");
+			// runDelta adds the global --json uniformly: `delta --json update --check` and `delta update --check --json` print the same output, as observed
 			const r = await runDelta(mode === "check" ? ["update", "--check"] : ["update"], {
 				cwd: rt.cwd,
 				timeoutMs: UPDATE_TIMEOUT_MS,
 			});
 			const ok = r.code === 0;
 			const parsed = parseUpdateResult(r.out + (r.err ? "\n" + r.err : ""));
-			// 插件过期检测:合约 min 超过本构建支持上限 ⇒ 必须重装;拿不到合约就不下结论,只留常量提示
+			// Plugin-outdated detection: a contract min above this build's ceiling ⇒ must reinstall; without the contract, no verdict — only the constant hint remains
 			let contractMin: number | null = null;
 			try {
 				const c = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
 				const min = Number(c?.min);
 				if (Number.isFinite(min)) contractMin = min;
 			} catch {
-				/* 无合约输出:仅保留常量提示 */
+				/* no contract output: only the constant hint remains */
 			}
 			notify(
 				renderUpdateReport({
@@ -2452,9 +2454,9 @@ export default function ompDelta(pi: any) {
 		},
 	});
 
-	// /delta 路由(#15,#17):转发到平铺命令的同一 handler;无参数输出用法菜单而非报错
+	// /delta router (#15,#17): forwards to the same handler as the flat command; with no argument, prints the usage menu instead of erroring
 	pi.registerCommand("delta", {
-		description: "omp-delta 命令路由:/delta share|join|status|retry|detach(无参数显示用法;平铺命令仍可用)",
+		description: "omp-delta command router: /delta share|join|status|retry|detach (no argument shows usage; flat commands still work)",
 		handler: async (args: string, ctx: any) => {
 			lastCtx = ctx;
 			const d = parseDeltaRouter(args);
@@ -2463,13 +2465,13 @@ export default function ompDelta(pi: any) {
 				return;
 			}
 			if (d.kind === "unknown") {
-				notify("未知子命令:" + d.command + "\n\n" + renderDeltaMenu(), "warning");
+				notify("Unknown subcommand: " + d.command + "\n\n" + renderDeltaMenu(), "warning");
 				return;
 			}
 			const handler = deltaHandlers[d.command];
 			if (!handler) {
-				// 注册顺序保证到这里必然已回填;防御性兑底
-				notify("内部错误:子命令 " + d.command + " 未注册。", "warning");
+				// Registration order guarantees this is filled in by now; defensive fallback
+				notify("Internal error: subcommand " + d.command + " is not registered.", "warning");
 				return;
 			}
 			await handler(d.args, ctx);
@@ -2478,53 +2480,53 @@ export default function ompDelta(pi: any) {
 
 	pi.on("session_start", async (_event: any, ctx: any) => {
 		lastCtx = ctx;
-		rt.eventCtx = ctx; // 托管定时器来源
+		rt.eventCtx = ctx; // source of managed timers
 		rt.isSub = (ctx?.agent?.kind ?? "main") !== "main";
 		if (rt.isSub) return;
-		rt.detached = false; // 新会话:显式 detach 语义不延续(绑定标记另行发现)
+		rt.detached = false; // new session: explicit detach semantics don't carry over (the binding marker is discovered separately)
 		rt.sid = String(ctx?.sessionManager?.getSessionId?.() ?? "sess-" + randomUUID());
 		rt.cwd = String(ctx?.cwd ?? process.cwd());
-		// #21:仓库策略(.delta/settings.json)决定无绑定时的自动连接;文件问题在此一次性提示
+		// #21: the repo policy (.delta/settings.json) decides auto-connect when unbound; file problems get a one-time notice here
 		const policyRoot = gitCheckoutRoot(rt.cwd);
 		const policyFile = policyRoot ? readRepoPolicyFile(policyRoot) : null;
 		if (policyFile?.policy.problem) {
-			notify(".delta/settings.json 无法使用(" + policyFile.policy.problem + ");修复前仅 /delta-share 手动同步生效。", "warning");
+			notify(".delta/settings.json is unusable (" + policyFile.policy.problem + "); until it is fixed, only manual /delta-share sync is active.", "warning");
 		}
-		// 绑定标记在 omp 会话记录里(appendEntry 写入,生命周期归 omp 管):
-		// 有标记 → 后台凭它重连;无标记 → 先按 checkout 发现,再按仓库策略自动连接(#21)。
+		// The binding marker lives in the omp session record (written by appendEntry, lifecycle owned by omp):
+		// marker present → reconnect in the background from it; no marker → discover by checkout first, then auto-connect per the repo policy (#21).
 		const marker = findSessionMarker(ctx);
-		// 决策(纯接缝):marker 永远优先,auto-connect 只兜底真正的全新会话
+		// Decision (pure seam): the marker always wins; auto-connect is only the fallback for a truly brand-new session
 		const syncAction = decideAutoSyncAction(policyFile?.policy ?? { mode: "manual", configured: false }, marker !== null);
 		if (marker) {
-			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连;
-			// 等待期间事件照常入临时队列(expectingIdentity),游标到达后重编号补发
+			// Don't block session_start (event handlers get a 30s budget): reconnect in the background;
+			// while waiting, events keep entering the temporary queue (expectingIdentity) and are renumbered and flushed once the cursor arrives
 			rt.expectingIdentity = true;
-			notify("发现会话绑定 Delta 线程 " + marker.threadId + ",后台重连中…");
-			paintStatus(ctx); // session_start:重建/校准槽位(session-replacing 边界,spinner 同款)
+			notify("Found the session's bound Delta thread " + marker.threadId + "; reconnecting in the background…");
+			paintStatus(ctx); // session_start: rebuild/recalibrate the slot (session-replacing boundary, same as the spinner)
 			void reconnectByIdentity(marker);
 		} else {
-			// 无 marker(moveOff/fork/首次):从服务端按 checkout 发现绑定;
-			// 发现不了才是真正的首次:策略为自动模式时自动连接,否则等显式 /delta-share(#21)。
+			// No marker (moveOff/fork/first run): discover the binding from the server by checkout;
+			// only when nothing is found is this truly a first run: auto-connect when the policy is an auto mode, else wait for an explicit /delta-share (#21).
 			rt.expectingIdentity = true;
 			paintStatus(ctx);
 			void (async () => {
 				try {
 					const found = await discoverBindingByCheckout();
 					if (found) {
-						notify("发现绑定当前 checkout 的 Delta 线程 " + found.threadId + ",后台重连中…");
+						notify("Found the Delta thread bound to this checkout: " + found.threadId + "; reconnecting in the background…");
 						await reconnectByIdentity(found);
 					} else if (syncAction.kind === "auto-connect") {
-						// 重连路径(marker/checkout 发现)都未命中才自动连接,不会绕过或与重连竞争;
-						// 连接窗口期 expectingIdentity 保持,记录入临时队列,游标到达后重编号
+						// Auto-connect only runs when both reconnect paths (marker/checkout discovery) missed; it never bypasses or races the reconnect;
+						// during the connect window expectingIdentity holds, records enter the temporary queue, and are renumbered once the cursor arrives
 						await autoConnect(syncAction.mode, syncAction.organization);
 					} else {
 						rt.expectingIdentity = false;
-						paintStatus(); // 发现不了绑定:回到 detached,清槽
+						paintStatus(); // no binding found: back to detached, slot cleared
 					}
 				} catch (e) {
 					rt.expectingIdentity = false;
 					paintStatus();
-					notify("Delta 绑定发现失败:" + String(e instanceof Error ? e.message : e) + "(/delta-share 可手动连接)", "warning");
+					notify("Delta binding discovery failed: " + String(e instanceof Error ? e.message : e) + " (/delta-share can connect manually)", "warning");
 				}
 			})();
 		}
@@ -2534,9 +2536,9 @@ export default function ompDelta(pi: any) {
 		if (rt.isSub || !rt.threadId) return;
 		if (rt.connected || rt.mountChild || rt.watchChild) {
 			detach(true);
-			notify("会话已切换,Delta 同步已停止;新会话可用 /delta-share 重新连接。");
+			notify("The session has switched; Delta sync stopped. The new session can reconnect with /delta-share.");
 		} else {
-			paintStatus(); // 重连在途中切换:无子进程可拆,但仍校准指示(no-op 时上游 dedup)
+			paintStatus(); // switched while a reconnect was in flight: no subprocesses to tear down, but still recalibrate the indicator (upstream dedups no-ops)
 		}
 	});
 
@@ -2544,14 +2546,14 @@ export default function ompDelta(pi: any) {
 		if (!shouldRecord()) return;
 		const text = String(event?.text ?? event?.prompt ?? "").trim();
 		if (!text) return;
-		if (text.startsWith("/")) return; // slash 命令不是对话内容,不记录
+		if (text.startsWith("/")) return; // slash commands are not conversation content, don't record
 		if (!rt.titleSent) {
 			rt.titleSent = true;
 			let title = "";
 			try {
 				title = String((await pi?.getSessionName?.()) ?? "");
 			} catch {
-				/* 无会话名 */
+				/* no session name */
 			}
 			emit({ sessionUpdate: "session_info_update", title: (title || text).slice(0, 120) });
 		}
@@ -2564,8 +2566,8 @@ export default function ompDelta(pi: any) {
 
 	pi.on("turn_start", () => {
 		if (!shouldRecord()) return;
-		// 合约要求:running 的 turnSequence 必须等于它自己的 sequence,否则 turn 不会开启,
-		// 后续 agent_message/tool_call 会被服务端静默丢弃(不生成 item)。
+		// Contract requirement: a running record's turnSequence must equal its own sequence, otherwise the turn never opens
+		// and subsequent agent_message/tool_call records are silently dropped server-side (no item generated).
 		const seq = nextSeq();
 		emit({ sessionUpdate: "state_update", state: "running" }, { turnSequence: seq, sequence: seq });
 		if (seq !== null) rt.currentTurn = seq;
@@ -2624,15 +2626,15 @@ export default function ompDelta(pi: any) {
 	});
 
 	pi.on("session_shutdown", () => {
-		// 处理器只有 2s 预算:只做同步清理,不等待 CLI 调用;无状态需要落盘(零本地状态)
+		// The handler only gets a 2s budget: synchronous cleanup only, no waiting on CLI calls; no state needs persisting (zero local state)
 		try {
 			killChild(rt.mountChild);
 			killChild(rt.watchChild);
 		} catch {
-			/* 尽力而为 */
+			/* best effort */
 		}
 		rt.mountChild = null;
 		rt.watchChild = null;
-		clearStatus(); // 释放状态槽位(单次同步 setStatus;研究§6:#18 会话拆卸约束)
+		clearStatus(); // release the status slot (one synchronous setStatus; research §6: #18 session teardown constraint)
 	});
 }

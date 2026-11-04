@@ -9,9 +9,9 @@ import {
 	pickMaterializeCandidate,
 } from "../omp-delta.ts";
 
-// #17:/delta-join 纯接缝(目标解析 + 失败分类)。live join 链接/share id/thread id 与
-// 错误签名均取自 delta 0.23.0 实采(见 docs/contract-notes.md Join links);
-// 这里只测提取与判定,不触网、不要求本地登录态。
+// #17: /delta-join pure seams (target parsing + failure classification). Live join links/share ids/thread ids and
+// error signatures come from delta 0.23.0 captures (see docs/contract-notes.md Join links);
+// this only tests extraction and classification — no network, no local sign-in required.
 
 describe("parseJoinTarget", () => {
 	it("extracts the share id from an https delta.dev join link", () => {
@@ -29,7 +29,7 @@ describe("parseJoinTarget", () => {
 	});
 
 	it("recognizes a bare share id without inventing a thread-id relationship", () => {
-		// 合约陷阱:share id(thread_01…)与 thread id 无派生关系,只做形态识别
+		            // Contract trap: a share id (thread_01…) has no derivation relationship to a thread id; only shape recognition applies
 		const r = parseJoinTarget("thread_01m6g8xfhjq7cxycw35h5h64zq");
 		assert.equal(r.kind, "share-id");
 		assert.equal((r as any).shareId, "thread_01m6g8xfhjq7cxycw35h5h64zq");
@@ -78,7 +78,7 @@ describe("parseJoinInvocation", () => {
 
 	it("--into takes the next token as the directory and implies move", () => {
 		const r = parseJoinInvocation("--into E:\\repos\\x thread_01abc");
-		assert.equal(r.move, false); // --into 隐含 move 的判定在 handler(explicit = move || into!==null)
+		            assert.equal(r.move, false); // the "--into implies move" decision lives in the handler (explicit = move || into!==null)
 		assert.equal(r.into, "E:\\repos\\x");
 		assert.equal(r.target.kind, "share-id");
 	});
@@ -157,7 +157,7 @@ describe("pickMaterializeCandidate", () => {
 });
 
 describe("deriveMaterializeDir", () => {
-	// 平台中立的基目录:dirname(cwd) 的同级 + delta- 前缀
+	    // Platform-neutral base directory: a sibling of dirname(cwd) + the delta- prefix
 	const base = process.platform === "win32" ? "E:\\w" : "/w";
 
 	it("derives a sibling directory with a delta- prefix", () => {
@@ -178,9 +178,9 @@ describe("deriveMaterializeDir", () => {
 });
 
 describe("classifyJoinFailure", () => {
-	// 实测错误签名(delta 0.23.0):
-	// - 他人私有/不存在的分享 id → not_visible "shared thread is absent or not visible"
-	// - 不属于本账号的线程 id / 链接有误 → invalid_reference "…exact thread ID in this account"
+	    // Error signatures observed live (delta 0.23.0):
+	    // - someone else's private/nonexistent share id → not_visible "shared thread is absent or not visible"
+	    // - a thread id not owned by this account / a wrong link → invalid_reference "…exact thread ID in this account"
 	const NOT_VISIBLE = 'delta: shared thread is absent or not visible\n{"error":{"code":"not_visible","reason":"not_visible","message":"shared thread is absent or not visible","retryable":false}}';
 	const INVALID_REF = 'delta: expected a supported Delta link, share ID, or exact thread ID in this account\n{"error":{"code":"invalid_reference","reason":"invalid_reference","message":"expected a supported Delta link, share ID, or exact thread ID in this account","retryable":false}}';
 
@@ -201,7 +201,7 @@ describe("classifyJoinFailure", () => {
 	it("unknown failures stay unknown (handler shows the raw CLI message)", () => {
 		assert.equal(classifyJoinFailure(""), "unknown");
 		assert.equal(classifyJoinFailure("delta: network unreachable"), "unknown");
-		// 供给窗口的重试签名不是账号问题:join 失败路径不把它伪装成可见性拒绝
+		            // The provisioning window's retry signature is not an account problem: the join failure path does not disguise it as a visibility rejection
 		assert.equal(classifyJoinFailure("the history is unavailable: NotFound"), "unknown");
 	});
 });

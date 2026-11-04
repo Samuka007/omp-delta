@@ -12,7 +12,7 @@ import {
 
 describe("collectReceipts", () => {
 	it("parses the contract-notes receipt shape", () => {
-		// docs/contract-notes.md 的实测回执
+		            // receipt shape observed in docs/contract-notes.md
 		const j = {
 			operation: "appended",
 			thread_id: "t",
@@ -46,7 +46,7 @@ describe("collectReceipts", () => {
 		);
 		assert.equal(into.get(1), "duplicate");
 		assert.equal(into.get(2), "duplicate");
-		assert.equal(into.get(3), "fenced"); // fenced 优先于 duplicate 标记
+		            assert.equal(into.get(3), "fenced"); // fenced takes precedence over the duplicate marker
 	});
 
 	it("ignores lines without sequence or disposition", () => {
@@ -112,7 +112,7 @@ describe("classifyAppendResult", () => {
 		const r = classifyAppendResult(1, err + "\n", "", new Map());
 		assert.equal(r.notVisible, true);
 		assert.equal(r.retryable, true);
-		assert.equal(r.retryAfter, 30_000); // 供给窗口统一 30s 长退避,不采信服务端短值
+		            assert.equal(r.retryAfter, 30_000); // provisioning window uses a uniform 30s long backoff; the server's short value is not trusted
 		assert.match(r.errMsg, /history is unavailable/);
 	});
 
@@ -147,7 +147,7 @@ describe("classifyAppendResult", () => {
 describe("isTransientProvisioning", () => {
 	it("matches every known provisioning-window signature", () => {
 		for (const msg of [
-			"worktree attach 失败: delta: the history is unavailable: NotFound",
+			                "worktree attach failed: delta: the history is unavailable: NotFound",
 			"error: not_visible",
 			"thread not in this account",
 			"invalid_reference",
@@ -158,7 +158,7 @@ describe("isTransientProvisioning", () => {
 	});
 
 	it("does not match permanent failures", () => {
-		assert.equal(isTransientProvisioning("当前目录不是 git 仓库"), false);
+		            assert.equal(isTransientProvisioning("the current directory is not a git repository"), false);
 		assert.equal(isTransientProvisioning(""), false);
 	});
 });
@@ -170,7 +170,7 @@ describe("buildAppendEnvelope", () => {
 			{ seq: 2, turnSequence: 1, update: { sessionUpdate: "agent_message" } },
 		]);
 		const lines = body.split("\n");
-		assert.equal(lines.length, 3); // 两条记录 + 末尾换行产生的空串
+		            assert.equal(lines.length, 3); // two records + the empty string from the trailing newline
 		assert.deepEqual(JSON.parse(lines[0]), { schemaVersion: 1, sequence: 1, update: { sessionUpdate: "user_message" } });
 		assert.deepEqual(JSON.parse(lines[1]), { schemaVersion: 1, sequence: 2, turnSequence: 1, update: { sessionUpdate: "agent_message" } });
 	});
@@ -195,7 +195,7 @@ describe("liveActivity", () => {
 
 	it("leaves unmarked updates untouched", () => {
 		const update = { sessionUpdate: "state_update", state: "running" };
-		assert.equal(liveActivity(update), update); // 同一引用:无 _meta 时原样返回
+		            assert.equal(liveActivity(update), update); // same reference: returned as-is when there is no _meta
 	});
 });
 
@@ -206,7 +206,7 @@ describe("parseJsonLines", () => {
 
 	it("falls back to whole-text JSON.parse for pretty-printed output (thread list shape)", () => {
 		const pretty = '[\n  {\n    "id": "ksQQaxtj",\n    "name": "manual probe"\n  },\n  {\n    "id": "ksQQg5RG",\n    "name": "probe"\n  }\n]';
-		// 整体 parse 的结果包一层:调用方(runDeltaJson 取末元素 / 调用侧 Array.isArray)按数组解包
+		            // the whole-body parse result is wrapped in an array: callers (runDeltaJson takes the last element / the call site checks Array.isArray) unwrap the array
 		assert.deepEqual(parseJsonLines(pretty), [
 			[
 				{ id: "ksQQaxtj", name: "manual probe" },

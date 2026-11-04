@@ -7,7 +7,7 @@ import {
 	resolveIdentityFromStatus,
 } from "../omp-delta.ts";
 
-// 形状取自实采 `delta --json thread status` 输出(Windows,2026-11-03)
+// Shape taken from a live `delta --json thread status` capture (Windows, 2026-11-03)
 const LIVE_STATUS = {
 	operation: "status",
 	thread_id: "ksQQcjPMeKogRtSeoe9dwsAR5JLOAARbRJIBxBBKMeC2HWlBK4Odm0QS-xgK",
@@ -41,7 +41,7 @@ describe("resolveIdentityFromStatus", () => {
 
 	it("join url is NOT derived from thread id (contract trap: share id ≠ thread id)", () => {
 		const id = resolveIdentityFromStatus(LIVE_STATUS);
-		assert.ok(!id!.url.includes(id!.threadId)); // join 链接用 thread_01… share id
+		            assert.ok(!id!.url.includes(id!.threadId)); // the join link uses a thread_01… share id
 	});
 
 	it("tolerates a fresh thread without producer/worktrees", () => {
@@ -67,7 +67,7 @@ describe("resolveIdentityFromStatus", () => {
 
 describe("pickWorktreeForCwd", () => {
 const items = [
-	// 实采形状:delta 把 checkout 物化在主 cwd 的 .delta/worktrees/ 子树(嵌套 checkouts[].directory)
+	    // Observed shape: delta materializes checkouts under the main cwd's .delta/worktrees/ subtree (nested checkouts[].directory)
 	{
 		reference: "2d47df5a-4d12-4586-aa8f-ad8712689747#t=4a31e0b6",
 		checkouts: [
@@ -112,14 +112,14 @@ describe("reconcileSequenceState", () => {
 	const rec = (seq: number) => ({ seq, update: {} });
 
 	it("drops delivered records, keeps undelivered, continues from the cursor", () => {
-		const r = reconcileSequenceState([rec(1), rec(2), rec(3)], 3); // 服务端已有 seq 1..2
-		assert.deepEqual(r.pending, [rec(3)]); // seq 3 未送达,保留
+		        const r = reconcileSequenceState([rec(1), rec(2), rec(3)], 3); // the server already has seq 1..2
+		        assert.deepEqual(r.pending, [rec(3)]); // seq 3 undelivered, kept
 		assert.equal(r.seq, 3);
 		assert.equal(r.lastAcked, 2);
 	});
 
 	it("keeps undelivered records and keeps numbering above the server cursor", () => {
-		const r = reconcileSequenceState([rec(1), rec(2), rec(3)], 2); // 服务端已有 seq 1
+		        const r = reconcileSequenceState([rec(1), rec(2), rec(3)], 2); // the server already has seq 1
 		assert.deepEqual(r.pending, [rec(2), rec(3)]);
 		assert.equal(r.seq, 3);
 		assert.equal(r.lastAcked, 1);

@@ -7,9 +7,9 @@ import {
 	type SyncIndicatorInput,
 } from "../omp-delta.ts";
 
-// #18:同步状态指示的纯接缝。Runtime 字段 → 状态(derive)与状态 → 文案(render)分开测;
-// 覆盖 synced/supplying/offline/paused→offline/detached 的转移对与短 id 截断。
-// 交互绘制(paintStatus / ctx.ui.setStatus)无法单测:见 docs/status-indicator-research.md §5。
+// #18: pure seams of the sync status indicator. Runtime fields → state (derive) and state → label (render) are tested separately;
+// covers the synced/supplying/offline/paused→offline/detached transition pairs and short-id truncation.
+// Interactive painting (paintStatus / ctx.ui.setStatus) cannot be unit-tested: see docs/status-indicator-research.md §5.
 
 function input(overrides: Partial<SyncIndicatorInput> = {}): SyncIndicatorInput {
 	return {
@@ -70,13 +70,13 @@ describe("deriveSyncIndicatorState", () => {
 	});
 
 	it("transitions: synced ↔ supplying ↔ offline ↔ detached follow field flips", () => {
-		// enqueue → drain(排队→同步)
+		        // enqueue → drain (queued → synced)
 		assert.equal(deriveSyncIndicatorState(input({ connected: true, pendingCount: 1 })), "supplying");
 		assert.equal(deriveSyncIndicatorState(input({ connected: true, pendingCount: 0 })), "synced");
-		// retry start/stop(重试起停)
+		        // retry start/stop
 		assert.equal(deriveSyncIndicatorState(input({ connected: true, retryAttempts: 0 })), "synced");
 		assert.equal(deriveSyncIndicatorState(input({ connected: true, retryAttempts: 2 })), "supplying");
-		// watch 掉线 → retry 恢复
+		        // watch drops → retry recovers
 		assert.equal(deriveSyncIndicatorState(input({ connected: false, retryAttempts: 2 })), "offline");
 	});
 });

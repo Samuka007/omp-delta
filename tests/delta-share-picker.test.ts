@@ -4,7 +4,7 @@ import { pickShareVisibility } from "../omp-delta.ts";
 
 const ORG = { id: "org_01", name: "Acme Corp" };
 
-/** 模拟 ctx.ui.select:记录每次调用的参数,reply 用所选 label(真实宿主返回选项一原样 label)或 undefined(Esc),抛错则模拟宿主异常。 */
+/** Fakes ctx.ui.select: records every call's arguments; reply returns the chosen label (the real host returns option one's label verbatim) or undefined (Esc); throwing simulates a host error. */
 function fakeSelect(reply: (title: string, options: Array<{ label: string; description?: string }>) => string | undefined) {
 	const calls: Array<{ title: string; options: Array<{ label: string; description?: string }> }> = [];
 	const select = async (title: string, options: Array<{ label: string; description?: string }>) => {
@@ -16,10 +16,10 @@ function fakeSelect(reply: (title: string, options: Array<{ label: string; descr
 
 describe("pickShareVisibility", () => {
 	it("no-arg share shows the selector: Private / org, and a Private pick flows through", async () => {
-		const ui = fakeSelect((_t, options) => options[0].label); // 用户选第一项 Private
+		            const ui = fakeSelect((_t, options) => options[0].label); // the user picks the first option, Private
 		const r = await pickShareVisibility("", ui as any, ORG);
-		assert.equal(ui.calls.length, 1); // 只弹一次选择器
-		assert.match(ui.calls[0].title, /可见性/);
+		            assert.equal(ui.calls.length, 1); // the picker opens only once
+		            assert.match(ui.calls[0].title, /visibility/i);
 		assert.equal(ui.calls[0].options.length, 2);
 		assert.match(ui.calls[0].options[0].label, /Private/);
 		assert.equal(r.mode, "private");
@@ -29,21 +29,21 @@ describe("pickShareVisibility", () => {
 	it("org option carries the current org name resolved by resolveOrg; picking it yields organization", async () => {
 		const ui = fakeSelect((_t, options) => options[1].label);
 		const r = await pickShareVisibility(undefined, ui as any, ORG);
-		assert.match(ui.calls[0].options[1].label, /Acme Corp/); // 组织名进选项(#16 要求按名展示)
+		            assert.match(ui.calls[0].options[1].label, /Acme Corp/); // the org name appears in the option (#16 requires showing it by name)
 		assert.equal(r.mode, "organization");
 		assert.equal(r.fallback, null);
 	});
 
 	it("explicit 'private' arg skips the picker entirely (back-compat, old normalization)", async () => {
 		const ui = fakeSelect(() => {
-			throw new Error("选择器不得在显式参数下打开");
+			                throw new Error("the picker must not open for explicit arguments");
 		});
 		for (const args of ["private", "  PRIVATE ", "priv"]) {
 			const r = await pickShareVisibility(args, ui as any, ORG);
 			assert.equal(r.mode, "private");
 			assert.equal(r.fallback, null);
 		}
-		assert.equal(ui.calls.length, 0); // 三次调用都未触碰选择器
+		            assert.equal(ui.calls.length, 0); // none of the three calls touched the picker
 	});
 
 	it("explicit non-private arg keeps old default (organization) without the picker", async () => {

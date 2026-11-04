@@ -7,7 +7,7 @@ import {
 	renderUpdateReport,
 } from "../omp-delta.ts";
 
-// docs/contract-notes.md 实采形状(delta 0.23.0,up-to-date;progress 帧无 status)
+// Shapes captured live from docs/contract-notes.md (delta 0.23.0, up-to-date; progress frames carry no status)
 const CHECK_UP_TO_DATE_JSONL =
 	'{"schema_version":1,"type":"progress","phase":"checking"}\n' +
 	'{"schema_version":1,"status":"up_to_date","current_version":"0.23.0","latest_version":"0.23.0","channel":"stable","can_install":true,"message":"Delta 0.23.0 is up to date."}\n';
@@ -67,7 +67,7 @@ describe("parseUpdateResult", () => {
 
 describe("pluginOutdatedFromContract", () => {
 	it("flags the plugin as outdated when contract min exceeds the plugin's supported max", () => {
-		// 实采形状是 {operation:"contract",min,max};函数只读 min,这里只保留有关字段
+		        // the observed shape is {operation:"contract",min,max}; the function only reads min, so only the relevant fields are kept here
 		assert.equal(pluginOutdatedFromContract({ min: 9 }), true);
 	});
 
@@ -87,15 +87,15 @@ describe("renderUpdateReport", () => {
 	it("check-only up-to-date: reports the version, states nothing was installed, and carries the reinstall hint", () => {
 		const out = renderUpdateReport({ mode: "check", result: parseUpdateResult(CHECK_UP_TO_DATE_JSONL), contractMin: 8 });
 		assert.match(out, /0\.23\.0/);
-		assert.match(out, /未安装/);
-		assert.ok(out.includes(PLUGIN_REINSTALL_CMD), "must contain the exact reinstall command");
-	});
+		        assert.match(out, /nothing was installed/);
+		        assert.ok(out.includes(PLUGIN_REINSTALL_CMD), "must contain the exact reinstall command");
+			});
 
-	it("check with a newer version available: says it did not install and mentions the restart", () => {
-		const out = renderUpdateReport({ mode: "check", result: updateAvailable(), contractMin: 8 });
-		assert.match(out, /0\.24\.0/);
-		assert.match(out, /未安装/);
-		assert.match(out, /重启/);
+			it("check with a newer version available: says it did not install and mentions the restart", () => {
+				const out = renderUpdateReport({ mode: "check", result: updateAvailable(), contractMin: 8 });
+				assert.match(out, /0\.24\.0/);
+				assert.match(out, /nothing was installed/);
+				assert.match(out, /restart/i);
 		assert.ok(out.includes(PLUGIN_REINSTALL_CMD));
 	});
 
@@ -106,21 +106,21 @@ describe("renderUpdateReport", () => {
 			contractMin: 8,
 		});
 		assert.match(out, /0\.24\.0/);
-		assert.match(out, /重启/);
+		assert.match(out, /restart/i);
 		assert.ok(out.includes(PLUGIN_REINSTALL_CMD));
 	});
 
 	it("update when already current: no restart line, hint still shown", () => {
 		const out = renderUpdateReport({ mode: "update", result: parseUpdateResult(CHECK_UP_TO_DATE_JSONL), contractMin: 8 });
-		assert.match(out, /已是最新/);
-		assert.doesNotMatch(out, /重启说明/);
+		assert.match(out, /already up to date/);
+		assert.doesNotMatch(out, /Restart note/);
 		assert.ok(out.includes(PLUGIN_REINSTALL_CMD));
 	});
 
 	it("contract min above plugin max: prints the definitive outdated line with the command", () => {
 		const out = renderUpdateReport({ mode: "check", result: parseUpdateResult(CHECK_UP_TO_DATE_JSONL), contractMin: 9 });
-		assert.match(out, /过旧/);
-		assert.match(out, /必须重装/);
+		assert.match(out, /outdated/);
+		assert.match(out, /must reinstall/);
 		assert.ok(out.includes(PLUGIN_REINSTALL_CMD));
 	});
 
@@ -132,7 +132,7 @@ describe("renderUpdateReport", () => {
 
 	it("unknown contract: no definitive claim, but the constant hint remains", () => {
 		const out = renderUpdateReport({ mode: "check", result: parseUpdateResult(CHECK_UP_TO_DATE_JSONL), contractMin: null });
-		assert.doesNotMatch(out, /必须重装/);
+		assert.doesNotMatch(out, /must reinstall/);
 		assert.ok(out.includes(PLUGIN_REINSTALL_CMD));
 	});
 });

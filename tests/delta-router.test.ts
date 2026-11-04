@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseDeltaRouter, renderDeltaMenu } from "../omp-delta.ts";
 
-// #15:/delta 路由决策(纯接缝)。路由与平铺命令共享同一 handler 对象,由注册助手保证;
-// 这里覆盖决策矩阵:menu/route/unimplemented/unknown + 大小写/空白/剩余参数语义。
+// #15: /delta routing decision (pure seam). The router and flat commands share the same handler objects, guaranteed by the registration helper;
+// this covers the decision matrix: menu/route/unimplemented/unknown + case/whitespace/rest-args semantics.
 
 describe("parseDeltaRouter", () => {
 	it("no args (empty or whitespace) → menu", () => {
@@ -79,7 +79,7 @@ describe("renderDeltaMenu", () => {
 
 	it("no longer marks join as unimplemented (#17 shipped)", () => {
 		const menu = renderDeltaMenu();
-		assert.ok(!menu.includes("尚未实现"));
+		            assert.ok(!menu.includes("not yet implemented"));
 		assert.ok(!menu.includes("#17"));
 	});
 });
