@@ -80,6 +80,7 @@ type Runtime = {
 	eventCtx: any; // event ctx from session_start: holds the managed setTimeout
 	detaching: boolean;
 	detached: boolean; // explicit user detach (#18): indicator clears its slot; restored only after a successful reconnect (distinct from disconnect offline)
+	reusedBinding: boolean; // #26: the last attach short-circuited on "already has a worktree" — the history reconcile was skipped; /delta-status shows it
 	mountChild: ChildProcess | null;
 	watchChild: ChildProcess | null;
 };
@@ -842,6 +843,119 @@ export function classifyAppendResult(
 	return { fenced, retryable, notVisible, retryAfter, errMsg };
 }
 
+// ---- Attach failure classification (#23): branch on the JSON error envelope (error.code / error.retryable /
+// error.retry_after_ms) instead of regex-matching human-readable stderr. Raw-text signatures remain only as a
+// fallback for non-JSON CLI output. #25/#26/#27/#28 all stand on this classification. ----
+
+export type AttachFailureKind = "provisioning" | "retryable" | "reused-binding" | "permanent";
+
+export type AttachFailureClass = {
+	kind: AttachFailureKind;
+	code: string; // envelope error.code / error.reason when present, else ""
+	retryAfterMs: number; // 0 for permanent failures
+	message: string; // human-readable error text (envelope message first, trimmed CLI output as fallback)
+};
+
+// Provisioning-window signatures for attach: a freshly created thread's history/worktree provisioning takes
+// seconds to minutes; the same identities are retryable with backoff (kept in sync with PROVISIONING_RE).
+const ATTACH_PROVISIONING_RE = /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i;
+const REUSED_BINDING_RE = /already has a worktree/i;
+
+/** Classifies one failed `worktree attach` result. Envelope first (error.code / retryable / retry_after_ms),
+ *  raw-text fallback when the CLI printed no JSON envelope:
+ *  - provisioning: thread/worktree history still provisioning — retryable with the fixed short backoff;
+ *  - retryable: the envelope says retryable — back off using retry_after_ms;
+ *  - reused-binding: the thread already carries this checkout — not a failure, attach short-circuits (#26);
+ *  - permanent: everything else (disconnected / worktree_remote_failed with retryable:false, unknown codes) —
+ *    deterministic, retries cannot fix it, surface immediately (#25). */
+export function classifyAttachFailure(code: number, err: string, out: string): AttachFailureClass {
+	const rawText = String(err ?? "") + "\n" + String(out ?? "");
+	const raw = rawText.trim();
+	const cls = (kind: AttachFailureKind, message: string, retryAfterMs = 0, ecode = ""): AttachFailureClass => ({
+		kind,
+		code: ecode,
+		retryAfterMs,
+		message: message.slice(0, 300),
+	});
+	// Reused binding is recognizable from either the envelope code or the raw text, and wins over everything else:
+	// it is not a failure at all (the mount relation persists).
+	if (REUSED_BINDING_RE.test(rawText)) return cls("reused-binding", "thread already has this worktree");
+	for (const j of parseJsonLines(err).concat(parseJsonLines(out))) {
+		const e = j?.error;
+		if (!e || typeof e !== "object") continue;
+		const ecode = String(e.code ?? e.reason ?? "");
+		const msg = String(e.message ?? "") || raw;
+		if (ATTACH_PROVISIONING_RE.test(ecode) || ATTACH_PROVISIONING_RE.test(String(e.message ?? ""))) {
+			return cls("provisioning", msg, 3_000, ecode);
+		}
+		if (e.retryable === true) return cls("retryable", msg, Number(e.retry_after_ms) || 5_000, ecode);
+		return cls("permanent", msg, 0, ecode);
+	}
+	// Non-JSON fallback (human-readable CLI output only)
+	if (code !== 0 && ATTACH_PROVISIONING_RE.test(rawText)) return cls("provisioning", raw, 3_000);
+	if (code === -1) return cls("retryable", "delta process unresponsive or terminated", 5_000);
+	return cls("permanent", raw || "exit " + code);
+}
+
+/** #25: deterministic attach failures translate to actionable guidance instead of raw stderr;
+ *  retryable classes keep their plain message (the caller keeps backing off automatically). */
+export function renderAttachFailureGuidance(c: AttachFailureClass): string {
+	const head = "worktree attach failed" + (c.code ? " (" + c.code + ")" : "") + ": " + c.message;
+	if (c.kind !== "permanent") return head;
+	return (
+		head +
+		"\nThis failure looks deterministic — retrying will not fix it. Next steps:" +
+		"\n  1. Check sign-in state: delta auth status (a signed-out or broken-credentials app fails every worktree operation)." +
+		"\n  2. Inspect ~/.local/share/delta/delta.log for \"[share-sync] … failed\" entries around the last attempt." +
+		"\n  3. If the log shows the same instant failure on every attempt, report upstream with that log excerpt."
+	);
+}
+
+/** Error carrying the attach classification (#25): /delta-retry reads `permanent` to tell "needs a human"
+ *  apart from "transient, will keep retrying". */
+export class AttachError extends Error {
+	cls: AttachFailureClass;
+	constructor(cls: AttachFailureClass) {
+		super(renderAttachFailureGuidance(cls));
+		this.name = "AttachError";
+		this.cls = cls;
+	}
+	get permanent(): boolean {
+		return this.cls.kind === "permanent";
+	}
+}
+
+/** #24: the connect notice prints only the server-provided url — never a link fabricated from the create thread id
+ *  (the share/join id is unrelated by derivation to thread_id; a fabricated link opens an empty thread page). */
+export function renderConnectNotice(threadId: string, url: string | null): string {
+	return (
+		"Delta thread connected: " +
+		threadId +
+		"\nOpen in browser: " +
+		(url ?? "(link not ready yet; run /delta-status to fetch it)") +
+		"\n(conversation and workspace files, including uncommitted changes, are syncing to Delta)"
+	);
+}
+
+// ---- Auth/terms preflight (#28): parity with delta-claude's requireAuthentication. Gate every
+// thread/worktree mutation on `delta auth status` so a signed-out/broken-credentials app produces one
+// actionable hint instead of confusing downstream failures (observed: an unauthenticated attach half-created
+// a thread membership that took a day to untangle). ----
+
+export type AuthPreflightState = "signed_in" | "signed_out" | "terms" | "unknown";
+
+export const DELTA_TERMS_URL = "https://zed.dev/delta/terms";
+
+/** Parses `delta auth status` output (JSON envelope first via text matching, human-readable fallback).
+ *  Order matters: terms rejection is checked before the generic signed-out signatures. */
+export function parseAuthStatus(text: string): AuthPreflightState {
+	if (/terms_not_accepted|access_denied[^\n]*terms/i.test(text)) return "terms";
+	if (/signed_out|not signed in|not logged in|logged out|not authenticated|authentication required|could not be restored/i.test(text))
+		return "signed_out";
+	if (/signed_in|signed in as|logged in as|authenticated as/i.test(text)) return "signed_in";
+	return "unknown";
+}
+
 /** append request body: one envelope per line, schemaVersion + sequence (+ turnSequence). */
 export function buildAppendEnvelope(pending: DeltaRecord[]): string {
 	return (
@@ -990,6 +1104,37 @@ export function pickWorktreeForCwd(items: any[], cwd: string): WorktreePick {
 	);
 	if (matches.length > 1) return { ref: "", ambiguous: true };
 	return { ref: matches.length === 1 ? String(matches[0]?.reference ?? "") : "", ambiguous: false };
+}
+
+/** #26: /delta-status distinguishes "reconciled" from "reused existing binding" (the attach short-circuit
+ *  skipped the history reconcile — reused bindings are fine but must be visible). */
+export function renderBindingState(worktreeRef: string | null, reusedBinding: boolean): string {
+	if (!worktreeRef) return "none";
+	return reusedBinding ? "reused existing binding (reconcile skipped on the last connect)" : "reconciled";
+}
+
+export type WorktreeResolution = {
+	ref: string;
+	source: "list" | "marker" | "create" | "none";
+	ambiguous: boolean;
+};
+
+/** #27: worktree picking with a pure seam — the list match wins; only then the session marker's stored
+ *  reference (cwd-verified: a marker from another directory must not mount this checkout); `create` is the
+ *  last resort. One checkout must not accumulate orphan identities on transient list misses. */
+export function resolveWorktreeChoice(
+	listRows: any[],
+	cwd: string,
+	markerRef?: string,
+	markerCwd?: string,
+): WorktreeResolution {
+	const pick = pickWorktreeForCwd(listRows, cwd);
+	if (pick.ambiguous) return { ref: "", source: "none", ambiguous: true };
+	if (pick.ref) return { ref: pick.ref, source: "list", ambiguous: false };
+	if (markerRef && (!markerCwd || normPath(markerCwd) === normPath(cwd))) {
+		return { ref: String(markerRef), source: "marker", ambiguous: false };
+	}
+	return { ref: "", source: "create", ambiguous: false };
 }
 
 export type SequenceState = { pending: DeltaRecord[]; seq: number; lastAcked: number };
@@ -1144,6 +1289,7 @@ export default function ompDelta(pi: any) {
 		eventCtx: null,
 		detaching: false,
 		detached: false,
+		reusedBinding: false,
 		mountChild: null,
 		watchChild: null,
 	};
@@ -1517,20 +1663,39 @@ export default function ompDelta(pi: any) {
 		if (!ref) throw new Error("Missing worktree reference; run /delta-share again.");
 		const a0 = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		let a = a0;
-		// A new thread's history/worktree provisioning takes seconds to minutes; all these signatures are retryable with backoff:
-		// not in this account / invalid_reference (the server hasn't seen the thread yet), history is unavailable (provisioning window)
-		for (let i = 0; a.code !== 0 && i < 20; i++) {
-			const blob = String(a.err || a.out);
-			if (!/not in this account|invalid_reference|history is unavailable|not_visible/i.test(blob)) break;
-			await new Promise<void>((r) => {
-				const t = (rt.eventCtx ?? lastCtx)?.setTimeout?.(r, 3_000);
-				if (!t) setTimeout(r, 3_000);
+		// (#23) Envelope-driven retry: provisioning backsoff on the fixed short backoff, retryable uses retry_after_ms;
+		// permanent surfaces immediately (no blind regex loop), reused-binding short-circuits but stays visible (#26).
+		let reused = false;
+		const waitBackoff = (ms: number) =>
+			new Promise<void>((r) => {
+				const t = (rt.eventCtx ?? lastCtx)?.setTimeout?.(r, ms);
+				if (!t) setTimeout(r, ms);
 			});
+		for (let i = 0; a.code !== 0 && i < 20; i++) {
+			const cls = classifyAttachFailure(a.code, a.err, a.out);
+			if (cls.kind === "reused-binding") {
+				reused = true;
+				break;
+			}
+			if (cls.kind === "permanent") break;
+			await waitBackoff(cls.kind === "retryable" ? Math.min(cls.retryAfterMs, 30_000) : 3_000);
 			a = await runDelta(["worktree", "attach", ref, "--thread", String(rt.threadId)], { cwd: rt.cwd });
 		}
-		// Reconnect case: when the thread already carries this checkout, attach errors, but the mount relation persists — reuse it directly
-		if (a.code !== 0 && !String(a.err || a.out).includes("already has a worktree")) {
-			throw new Error("worktree attach failed: " + String(a.err || a.out).slice(0, 300));
+		if (a.code !== 0) {
+			const cls = classifyAttachFailure(a.code, a.err, a.out);
+			if (cls.kind === "reused-binding") {
+				reused = true;
+			} else {
+				throw new AttachError(cls); // (#25) permanent failures carry actionable guidance; retryables are exhausted here
+			}
+		}
+		rt.reusedBinding = reused;
+		if (reused) {
+			notify(
+				"Attach short-circuited: the thread already carries this checkout, so the history reconcile was skipped. " +
+					"If the thread looks broken on the Delta side, /delta-detach then /delta-share to force a fresh reconcile.",
+				"warning",
+			);
 		}
 
 		// mount uploads the checkout and keeps syncing; continue once the ready line appears, the process keeps running.
@@ -1565,6 +1730,19 @@ export default function ompDelta(pi: any) {
 		paintStatus(); // connect: confirms/clears offline at the supplying/synced starting point
 	}
 
+	/** #28: auth/terms preflight (parity with delta-claude's requireAuthentication) — runs before any
+	 *  thread/worktree mutation; signed_in and unknown proceed without extra prompts. */
+	async function preflightAuth(): Promise<void> {
+		const r = await runDelta(["auth", "status"], { cwd: rt.cwd });
+		const state = parseAuthStatus(r.out + "\n" + r.err);
+		if (state === "terms") {
+			throw new Error("Delta terms of service are not accepted for this account. Open " + DELTA_TERMS_URL + " to accept them, then retry.");
+		}
+		if (state === "signed_out") {
+			throw new Error(ORG_UNAUTH_HINT);
+		}
+	}
+
 	/** Contract handshake (shared by share and join): the CLI's supported range must intersect what this plugin implements. */
 	async function ensureContractCompatible(): Promise<void> {
 		const contract = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
@@ -1597,14 +1775,19 @@ export default function ompDelta(pi: any) {
 	async function resolveLocalWorktreeRef(): Promise<string> {
 		const list = await runDeltaJson(["worktree", "list"], { cwd: rt.cwd });
 		const rows: any[] = Array.isArray(list) ? list : (list?.worktrees ?? list?.items ?? []);
-		const pick = pickWorktreeForCwd(rows, rt.cwd);
-		if (pick.ambiguous) {
+		// (#27) Prefer the session marker's stored reference (cwd-verified) over creating: a transient list miss
+		// used to mint a brand-new identity every time (4 orphans in one day on one checkout).
+		const marker = findSessionMarker(lastCtx);
+		const r = resolveWorktreeChoice(rows, rt.cwd, marker?.worktreeRef, marker?.cwd);
+		if (r.ambiguous) {
 			throw new Error("Multiple worktree identities exist for this checkout; pick the right one in Delta first, then retry.");
 		}
-		let ref = pick.ref;
-		if (!ref) {
+		let ref = r.ref;
+		if (r.source === "create") {
+			log("worktree: neither list nor marker produced a reference; creating a new identity for " + rt.cwd);
 			const w = await runDeltaJson(["worktree", "create", rt.cwd], { cwd: rt.cwd });
 			ref = String(w?.reference ?? "");
+			if (ref) notify("Created a new Delta worktree identity " + ref + " for this checkout (no existing identity matched).");
 		}
 		if (!ref) throw new Error("Neither worktree create nor list produced a reference.");
 		return ref;
@@ -1630,6 +1813,7 @@ export default function ompDelta(pi: any) {
 	/** First connect: contract negotiation → create thread (idempotent) → worktree → start recording. The org is resolved by the caller beforehand. */
 	async function connectShared(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
 		await ensureContractCompatible();
+		await preflightAuth(); // (#28) before any thread/worktree mutation: signed-out/broken credentials once half-created a membership
 		assertGitCheckout();
 
 		// The org was resolved before the consent dialog in the command handler (resolveOrg); use it directly here.
@@ -1691,13 +1875,20 @@ export default function ompDelta(pi: any) {
 
 		persistBinding();
 
-			notify(
-				"Delta thread connected: " +
-					rt.threadId +
-					"\nOpen in browser: " +
-					(rt.url ?? "https://delta.dev/join/" + rt.threadId) +
-					"\n(conversation and workspace files, including uncommitted changes, are syncing to Delta)",
-			);
+		// (#24) One extra status re-query when the provisioning window swallowed the url: the notice must never
+		// fabricate a join link from the create thread id — print the pending message instead.
+		if (!rt.url) {
+			try {
+				const st = await runDeltaJson(
+					["thread", "status", rt.threadId!, "--source", SOURCE, "--external-id", rt.sid],
+					{ cwd: rt.cwd },
+				);
+				rt.url = resolveIdentityFromStatus(st)?.url || rt.url;
+			} catch {
+				/* still provisioning: the notice says the link is pending */
+			}
+		}
+		notify(renderConnectNotice(rt.threadId!, rt.url));
 	}
 
 	/** Background connect retry (the provisioning window has been observed at 10+ minutes; budget 40×30s). failLabel: /delta-share uses the default reconnect wording;
@@ -1812,6 +2003,7 @@ export default function ompDelta(pi: any) {
 	/** Weak join tail (#17): attach the current checkout — worktree resolution → attach → mount → watch.
 	 *  Precondition: the caller has confirmed the current directory is the checkout to attach (weak join semantics). */
 	async function attachJoined(id: DeltaIdentity): Promise<void> {
+		await preflightAuth(); // (#28) before the worktree attach mutation
 		adoptJoinedIdentity(id);
 		rt.worktreeRef = await resolveLocalWorktreeRef();
 		await attachAndStream();
@@ -1867,6 +2059,7 @@ export default function ompDelta(pi: any) {
 	 *  the omp session itself only migrates when the user runs /move manually (automation pending upstream oh-my-pi#17441),
 	 *  but sync/watch/cursor don't depend on the session cwd — everything continues seamlessly after /move, see contract-notes. */
 	async function materializeJoined(id: DeltaIdentity, ref: string, dir: string): Promise<void> {
+		await preflightAuth(); // (#28) before the mount materialization mutation
 		adoptJoinedIdentity(id);
 		const actual = await materializeCheckout(ref, dir);
 		rt.cwd = actual;
@@ -2238,6 +2431,7 @@ export default function ompDelta(pi: any) {
 				rt.threadId ? "Visibility: " + (rt.visibility ?? "unknown") : "",
 				rt.threadId ? "Link: " + (rt.url ?? "(not fetched yet; updates automatically after reconnect)") : "",
 				"Records: " + rt.seq + " assigned, " + rt.lastAcked + " acked, " + rt.pending.length + " queued",
+				"Binding: " + renderBindingState(rt.worktreeRef, rt.reusedBinding), // #26: reconciled vs reused-binding visible
 				"worktree: " + (rt.worktreeRef ?? "none"),
 				"mount/watch: " + (rt.mountChild ? "running" : "stopped") + " / " + (rt.watchChild ? "running" : "stopped"),
 				"Session: " + (rt.isSub ? "subagent (not recorded)" : "main") + " · " + rt.sid,
@@ -2399,7 +2593,17 @@ export default function ompDelta(pi: any) {
 					await attachAndStream();
 					notify("Reconnected.");
 				} catch (e) {
-					notify("Reconnect failed: " + String(e instanceof Error ? e.message : e), "warning");
+					// (#25) Make the failure class obvious: permanent → "needs a human" (guidance in the message);
+					// everything else → transient, auto-retry keeps backing off.
+					if (e instanceof AttachError && e.permanent) {
+						notify("Reconnect failed — this needs a human; auto-retry will not fix it.\n" + e.message, "warning");
+					} else {
+						notify(
+							"Reconnect failed (transient; auto-retry keeps trying, /delta-retry to try again): " +
+								String(e instanceof Error ? e.message : e),
+								"warning",
+							);
+					}
 					paintStatus(); // reconnect failed: the thread still exists → offline
 					return;
 				}
