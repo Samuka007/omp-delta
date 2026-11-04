@@ -1003,11 +1003,15 @@ export function liveActivity(update: Record<string, unknown>): Record<string, un
 
 export type ExportUpdate = Record<string, unknown> & { sessionUpdate: string };
 
-/** Empty-thread guard (#29): export only onto a fresh producer. next_sequence 1 (or unknown — the
- *  provisioning window hides status) means the thread carries no records; anything above 1 is an
- *  existing thread (re-share) and must not duplicate anything. */
-export function shouldExportHistory(serverNextSequence: number | null | undefined): boolean {
-	return serverNextSequence === null || serverNextSequence === undefined || serverNextSequence <= 1;
+/** Empty-thread guard (#29): export only onto a fresh producer. next_sequence 1 means the thread
+ *  carries no records; anything above 1 is an existing thread (re-share) and must not duplicate
+ *  anything. Unknown (provisioning window hides status) is decided by hasPriorBinding: a first share
+ *  has no binding marker and must export even while status is not yet visible (fail-closed there would
+ *  deadlock a brand-new empty container — see connectShared); a re-share onto an existing thread
+ *  (marker present) skips the export rather than risk duplicating records. */
+export function shouldExportHistory(serverNextSequence: number | null | undefined, hasPriorBinding = false): boolean {
+	if (serverNextSequence === null || serverNextSequence === undefined) return !hasPriorBinding;
+	return serverNextSequence <= 1;
 }
 
 function isTextBlock(b: any): boolean {
@@ -1133,7 +1137,9 @@ export function buildInitialExportRecords(messages: readonly any[], startSeq: nu
 	const updatesByMessage = messages.map((m, i) => exportMessageUpdates(m, "h" + i));
 	const opensTurn = (i: number) => {
 		const m: any = messages[i];
-		return m?.role === "user" && !m.synthetic && !m.steering && updatesByMessage[i]!.length > 0;
+		// synthetic/steering exclusion is implied: exportMessageUpdates returns [] for those, and an
+		// opener must produce a user_message row
+		return m?.role === "user" && updatesByMessage[i]!.length > 0;
 	};
 	// Turn ranges: an opening prompt runs through every following message until the next opening prompt
 	// (or the end of the transcript), so the turn's idle closes after its last message.
@@ -1916,6 +1922,10 @@ export default function ompDelta(pi: any) {
 
 		rt.connected = true;
 		rt.connectAttempts = 0;
+		// OD-5 barrier note: exported history still sits in rt.pending at this point. Watch only consumes
+		// inbound frames (comments/supersede), so starting it before the backlog drains matches the
+		// reference plugin (delta-claude also starts the conversation before drain); our own rows reach the
+		// thread strictly in sequence order through flush(), so joiners still see history before the live tail.
 		startWatch();
 		void flush();
 		paintStatus(); // connect: confirms/clears offline at the supplying/synced starting point
@@ -2052,7 +2062,7 @@ export default function ompDelta(pi: any) {
 		// cannot interleave with live events: turns made "during" the export enter the normal queue and
 		// are appended after the exported records (delivery preserves sequence order). The empty-thread
 		// guard keeps a re-share onto a thread that already has records from duplicating anything.
-		if (shouldExportHistory(id?.nextSequence ?? null)) {
+		if (shouldExportHistory(id?.nextSequence ?? null, findSessionMarker(lastCtx) !== null)) {
 			const messages = readTranscriptMessages();
 			const records = buildInitialExportRecords(messages, rt.seq + 1);
 			if (records.length) {

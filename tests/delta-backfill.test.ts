@@ -40,15 +40,21 @@ const toolResultMsg = (toolCallId: string, text: string, extra: Record<string, u
 });
 
 describe("shouldExportHistory", () => {
-	it("exports onto a fresh producer and while the cursor is unknown", () => {
+	it("exports onto a fresh producer", () => {
 		assert.equal(shouldExportHistory(1), true);
 		assert.equal(shouldExportHistory(0), true);
-		assert.equal(shouldExportHistory(null), true); // provisioning window: status failed
-		assert.equal(shouldExportHistory(undefined), true);
 	});
 	it("never exports onto a producer that already has records", () => {
 		assert.equal(shouldExportHistory(2), false);
 		assert.equal(shouldExportHistory(9), false);
+	});
+	it("decides unknown status by prior binding, not blindly", () => {
+		// first share (no marker): export even while the provisioning window hides status
+		assert.equal(shouldExportHistory(null, false), true);
+		assert.equal(shouldExportHistory(undefined, false), true);
+		// re-share (marker present): unknown status skips the export instead of risking duplication
+		assert.equal(shouldExportHistory(null, true), false);
+		assert.equal(shouldExportHistory(undefined, true), false);
 	});
 });
 
