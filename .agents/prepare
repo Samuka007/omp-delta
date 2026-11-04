@@ -3,13 +3,28 @@
 # 依赖版本由已提交的 bun.lock 锁定;脚本需幂等、非交互。
 set -eu
 
-# bun 缺失时尽力安装(优先 npm 全局包,失败则给出明确提示)
+# bun 缺失时按 bun.sh 官方渠道安装(平台分支参考 uname;Delta 在 Windows 上经 Git Bash
+# 运行本脚本,故分支写在同一 POSIX 脚本内,而非分开的 prepare 文件)
 if ! command -v bun >/dev/null 2>&1; then
-	if command -v npm >/dev/null 2>&1; then
-		npm install -g bun
-	else
-		echo "bun not found and npm unavailable; install bun from https://bun.sh first" >&2
-		exit 1
+	case "$(uname -s)" in
+		MINGW*|MSYS*|CYGWIN*)
+			# Windows 官方安装器:PowerShell 脚本(装到 %USERPROFILE%\.bun\bin)
+			powershell.exe -NoProfile -ExecutionPolicy Bypass -Command 'iex (irm bun.sh/install.ps1)'
+			;;
+		*)
+			# macOS/Linux 官方安装器(装到 ~/.bun/bin)
+			curl -fsSL https://bun.sh/install | bash
+			;;
+	esac
+	export PATH="$HOME/.bun/bin:$PATH"
+	# 官方渠道失败时降级 npm( bun.sh 官方文档列出的替代安装渠道)
+	if ! command -v bun >/dev/null 2>&1; then
+		if command -v npm >/dev/null 2>&1; then
+			npm install -g bun
+		else
+			echo "bun install failed and npm unavailable; install bun from https://bun.sh first" >&2
+			exit 1
+		fi
 	fi
 fi
 
