@@ -28,6 +28,14 @@ omp plugin link ./omp-delta
 
 Requires Delta desktop ≥ 0.23.0, signed in (`delta auth status`), and omp running inside a git repository **with a remote**.
 
+> **Windows note:** `omp plugin install` (18.x) can fail silently on Windows ("package.json not found") while leaving nothing in `~/.omp/plugins/node_modules/`. Workaround — install via npm into the plugins root directly:
+>
+> ```sh
+> cd ~/.omp/plugins && npm install 'github:Samuka007/omp-delta'
+> ```
+>
+> The result is identical to a successful `omp plugin install` (`omp plugin list` shows `omp-delta@0.1.0`).
+
 ## Known limits (MVP)
 
 - Main session only; omp subagents → Delta child threads not yet implemented
