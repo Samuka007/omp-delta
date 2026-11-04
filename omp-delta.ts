@@ -99,27 +99,43 @@ function dumpSpawnEnvOnce() {
 	}
 }
 
+// Discovery 顺序对齐参考插件(zed-industries/delta-claude hooks/cli/cli.ts):
+// PATH 优先,再按平台尝试安装器的 App Bundle 位置(Linux 默认 ~/.local/delta.app/bin/delta)。
+// 不提供 DELTA_BIN 之类的环境变量覆盖,与参考插件保持一致。
 function resolveDelta(): string {
 	if (deltaBin) return deltaBin;
+	const home = process.env.HOME ?? "";
 	const lc = process.env.LOCALAPPDATA ?? "";
 	const candidates = [
 		"delta",
+		home ? path.join(home, ".local", "delta.app", "bin", "delta") : "", // Linux: install.sh 默认位置
+		home ? path.join(home, "Applications", "Delta.app", "Contents", "MacOS", "delta") : "",
+		"/Applications/Delta.app/Contents/MacOS/delta", // macOS: App Bundle 内置 CLI,未装 PATH 时
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta.exe") : "",
 		lc ? path.join(lc, "Programs", "Delta", "bin", "delta") : "",
-		"/Applications/Delta.app/Contents/MacOS/delta", // macOS: App Bundle 内置 CLI,未装 PATH 时
 	].filter(Boolean);
 	for (const c of candidates) {
-		try {
-			const r = spawnSync(c, ["--version"], { windowsHide: true, timeout: 10_000 });
-			if (r.status === 0) {
-				deltaBin = c;
-				return c;
-			}
-		} catch {
-			/* 尝试下一个候选路径 */
-		}
+		if (!isDeltaCli(c)) continue;
+		deltaBin = c;
+		return c;
 	}
-	throw new Error("找不到 delta CLI(请确认 Delta 已安装并在 PATH 中,或重启 Delta 让新 PATH 生效)");
+	throw new Error(
+		"找不到 delta CLI(PATH 中的 delta 若是同名 git pager 会被跳过)。" +
+			"请安装 Delta(curl -fsSL https://delta.dev/install.sh | sh)后重启 omp",
+	);
+}
+
+// `delta --version` 无法区分 Delta CLI 与同名的 git pager(两者都输出 "delta X.Y.Z"),
+// 参考插件直接信任 command -v 的结果,但 NixOS 等发行版的 PATH 里 delta 是 git pager,
+// 所以这里用 `--help` 检查子命令列表(Delta CLI 独有 org/thread/worktree 等)才算命中。
+function isDeltaCli(bin: string): boolean {
+	try {
+		const r = spawnSync(bin, ["--help"], { windowsHide: true, timeout: 10_000 });
+		const out = String(r.stdout) + String(r.stderr);
+		return r.status === 0 && /Commands:/.test(out) && /\bthread\b/.test(out) && /\borg\b/.test(out);
+	} catch {
+		return false;
+	}
 }
 
 function runDelta(
