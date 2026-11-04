@@ -11,6 +11,7 @@
  *   - 只记录主会话(ctx.agent.kind === "main");子代理 → Delta 子线程留待下一步
  *   - 首次连接从当下开始记录,不回导历史会话
  *   - 命令:/delta(路由)与平铺别名 /delta-share /delta-status /delta-detach /delta-retry /delta-org(只读) /delta-update
+ *     /delta-setup(#21):仓库级同步策略 .delta/settings.json(兼容 delta-claude),private/organization 自动连接新会话
  *
  * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
  * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
@@ -23,6 +24,7 @@
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 
@@ -349,7 +351,7 @@ export function renderDeltaMenu(): string {
 		"  /delta retry             恢复/重试推送(= /delta-retry)",
 		"  /delta detach            断开同步(= /delta-detach)",
 		"  /delta join <link|id>    加入已有线程(尚未实现:#17)",
-		"  其他命令:/delta-org list|current · /delta-update [check]",
+		"  其他命令:/delta-setup [private|organization|manual] · /delta-org list|current · /delta-update [check]",
 		"  平铺别名继续可用:/delta-share /delta-status /delta-detach /delta-retry",
 	].join("\n");
 }
@@ -391,6 +393,230 @@ export function formatOrgList(orgs: OrgInfo[]): string {
 	return orgs
 		.map((o) => (o.current ? "* " : "  ") + o.name + " (" + o.id + ")" + (o.current ? " ← 当前:共享将使用此组织" : ""))
 		.join("\n");
+}
+
+// ---- /delta-setup 仓库同步策略(#21):.delta/settings.json,格式兼容 zed-industries/delta-claude ----
+// 格式权威:delta-claude hooks/setup/project-policy.ts(细节记录在 docs/contract-notes.md「Repo policy」)。
+// 形状:{"threads":{"mode":"manual|private|organization","organization":"<org id>"}};
+// private/organization 要求非空 organization(delta-claude 存 team.id,这里存 delta org list 的 id);
+// manual 可带 organization(delta-claude 语义:/delta share 的共享目标,omp 暂不消费);其余键原样保留。
+// 注意:仓库里的 .delta/ 目录是 Delta 自己的 worktree 簿记,与这份策略文件无关,忽略规则只认 settings.json 这一个路径。
+
+/** 仓库的同步模式(缺文件/未配置 = manual,现状行为:仅显式 /delta-share)。 */
+export type ThreadMode = "manual" | "private" | "organization";
+
+/** 校验后的有效策略。problem 非空 = 文件存在但用不了(manual 兜底,提示只出一次)。 */
+export type ProjectPolicy = {
+	mode: ThreadMode;
+	organization?: string;
+	configured: boolean; // 文件刻意配置了策略;缺文件/缺 threads/缺 mode 都算未配置
+	problem?: string; // 文件无法使用的原因(session_start 一次性提示,/delta-status 常驻展示)
+};
+
+/** 策略文件读取结果:policy = 有效策略;document = 原始文档(重写时未知键不丢);malformed = 解析失败。 */
+export type PolicyFile = {
+	policy: ProjectPolicy;
+	document?: Record<string, unknown>;
+	malformed?: boolean;
+};
+
+const POLICY_MODES: readonly ThreadMode[] = ["manual", "private", "organization"];
+
+function isJsonObject(v: unknown): v is Record<string, unknown> {
+	return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** 解析并校验策略文本(缺文件传 undefined)。语义与 delta-claude readProjectPolicy 对齐:
+ *  缺文件/缺 threads/缺 mode → 未配置 manual(无 problem);malformed JSON/非对象/非法 mode/
+ *  自动模式缺 organization → manual 兜底 + problem。 */
+export function readProjectPolicy(text: string | undefined): PolicyFile {
+	if (text === undefined) return { policy: { mode: "manual", configured: false } };
+	let document: unknown;
+	try {
+		document = JSON.parse(text);
+	} catch (e) {
+		return { malformed: true, policy: { mode: "manual", configured: false, problem: "不是有效 JSON(" + String(e instanceof Error ? e.message : e) + ")" } };
+	}
+	if (!isJsonObject(document)) {
+		return { malformed: true, policy: { mode: "manual", configured: false, problem: "内容不是 JSON 对象" } };
+	}
+	const threads = document.threads;
+	if (threads === undefined) return { document, policy: { mode: "manual", configured: false } };
+	if (!isJsonObject(threads)) {
+		return { document, policy: { mode: "manual", configured: false, problem: "threads 的值不是对象" } };
+	}
+	const mode = threads.mode;
+	if (mode === undefined) return { document, policy: { mode: "manual", configured: false } };
+	if (typeof mode !== "string" || !POLICY_MODES.includes(mode as ThreadMode)) {
+		return { document, policy: { mode: "manual", configured: false, problem: "mode 必须是 " + POLICY_MODES.join(" / ") + " 之一" } };
+	}
+	const organization = threads.organization;
+	if (mode === "manual") {
+		// manual 允许带 organization(delta-claude 语义:/delta share 的共享目标)
+		const policy: ProjectPolicy = { mode: "manual", configured: true };
+		if (typeof organization === "string" && organization.trim()) policy.organization = organization;
+		return { document, policy };
+	}
+	if (typeof organization !== "string" || !organization.trim()) {
+		return { document, policy: { mode: "manual", configured: false, problem: 'mode "' + mode + '" 需要非空 organization' } };
+	}
+	return { document, policy: { mode: mode as ThreadMode, organization, configured: true } };
+}
+
+/** 序列化策略:保留上一文档全部未知键(顶层与 threads 内),2 空格缩进 + 末尾换行(同 delta-claude)。
+ *  organization === undefined 时删除 threads.organization(manual 不写组织)。 */
+export function serializeProjectPolicy(
+	previous: Record<string, unknown> | undefined,
+	mode: ThreadMode,
+	organization?: string,
+): string {
+	const document = isJsonObject(previous) ? { ...previous } : {};
+	const prevThreads = document.threads;
+	const threads = isJsonObject(prevThreads) ? { ...prevThreads } : {};
+	threads.mode = mode;
+	if (organization === undefined) delete threads.organization;
+	else threads.organization = organization;
+	document.threads = threads;
+	return JSON.stringify(document, null, 2) + "\n";
+}
+
+/** 策略是否自动记录(无需显式 /delta-share):private / organization。 */
+export function recordsAutomatically(policy: ProjectPolicy): boolean {
+	return policy.mode === "private" || policy.mode === "organization";
+}
+
+/** session_start 的自动同步决策(#21,纯接缝,单测覆盖):
+ *  - 既有绑定标记永远优先 → reconnect(auto-connect 不参与竞争,绝不绕过 marker/重连);
+ *  - 无标记且策略为自动模式(带组织)→ auto-connect(调用方还要求 checkout 发现未命中);
+ *  - 其余(manual/未配置/自动模式缺组织)→ manual,等显式 /delta-share。 */
+export type AutoSyncAction =
+	| { kind: "reconnect"; reason: "marker" }
+	| { kind: "auto-connect"; mode: "private" | "organization"; organization: string }
+	| { kind: "manual"; configured: boolean };
+
+export function decideAutoSyncAction(policy: ProjectPolicy, hasMarker: boolean): AutoSyncAction {
+	if (hasMarker) return { kind: "reconnect", reason: "marker" };
+	if (recordsAutomatically(policy) && policy.organization) {
+		return { kind: "auto-connect", mode: policy.mode as "private" | "organization", organization: policy.organization };
+	}
+	return { kind: "manual", configured: policy.configured };
+}
+
+/** /delta-status 的策略行(#21):让"为什么自动连接了/没连"可见。 */
+export function renderProjectPolicy(p: ProjectPolicy): string {
+	if (p.problem) return "manual(策略文件无法使用:" + p.problem + ")";
+	if (!p.configured) return "manual(未配置:仅 /delta-share 手动同步;/delta-setup 可选自动)";
+	if (p.mode === "manual") return "manual(仅 /delta-share 手动同步)";
+	if (p.mode === "private") return "private(新会话自动同步,私有线程;组织 " + (p.organization ?? "?") + ")";
+	return "organization(新会话自动同步并共享给组织 " + (p.organization ?? "?") + ")";
+}
+
+// ---- /delta-setup 参数与选择器(#21,复用 #16 的 ui.select 接缝模式) ----
+
+export type SetupArgDecision =
+	| { kind: "picker" } // 无参数:交互选择器
+	| { kind: "set"; mode: ThreadMode } // 显式模式:直接写文件
+	| { kind: "invalid"; arg: string }; // 未知参数:用法提示,绝不猜测写入
+
+/** /delta-setup 显式参数解析:private/priv* → private(归一化与 #16 pickShareVisibility 一致),
+ *  organization/org → organization,manual → manual;大小写不敏感。 */
+export function parseSetupModeArg(args: string): SetupArgDecision {
+	const arg = String(args ?? "").trim().toLowerCase();
+	if (!arg) return { kind: "picker" };
+	if (arg === "manual") return { kind: "set", mode: "manual" };
+	if (arg === "organization" || arg === "org") return { kind: "set", mode: "organization" };
+	if (arg.startsWith("priv")) return { kind: "set", mode: "private" };
+	return { kind: "invalid", arg };
+}
+
+export type SetupModePick = { mode: ThreadMode | null; fallback: string | null };
+
+/** /delta-setup 模式选择器(无参数时):
+ *  - ctx.ui.select 三选一:Private sync / Team sharing(带组织名;英文模式名与 delta-claude MODE_NAMES 对齐)/ Manual;
+ *  - 非交互(select 缺失/抛错)→ 回落 manual(= 现状,绝不静默开启自动同步)并带回 fallback 文案;
+ *  - 用户放弃(Esc)或无法识别的标签 → mode null,调用方按取消处理(不写文件)。 */
+export async function pickSetupMode(ui: any, org: { id: string; name: string } | null): Promise<SetupModePick> {
+	const orgName = org?.name || "当前组织";
+	const options = [
+		{ label: "Private sync(私有:新会话自动同步,仅自己可见)", description: "私有线程,不共享" },
+		{ label: "Team sharing(共享:新会话自动同步并共享给 " + orgName + ")", description: "组织成员可见" },
+		{ label: "Manual(手动:仅 /delta-share 时同步)", description: "保持现状,不自动连接" },
+	];
+	const select = ui?.select; // ExtensionUIContext.select(title, options): Promise<string | undefined>,返回所选 label
+	if (typeof select !== "function") {
+		return {
+			mode: "manual",
+			fallback: "当前环境不支持交互选择,已按现状写入 manual;要启用自动同步请显式运行 /delta-setup private 或 /delta-setup organization",
+		};
+	}
+	let label: unknown;
+	try {
+		label = await select("选择本仓库的 Delta 同步策略", options);
+	} catch (e) {
+		return {
+			mode: "manual",
+			fallback: "策略选择器不可用(" + String(e instanceof Error ? e.message : e) + "),已按现状写入 manual;要启用自动同步请显式运行 /delta-setup private 或 /delta-setup organization",
+		};
+	}
+	if (typeof label !== "string") return { mode: null, fallback: null }; // 用户放弃(Esc)
+	if (label === options[0].label) return { mode: "private", fallback: null };
+	if (label === options[1].label) return { mode: "organization", fallback: null };
+	if (label === options[2].label) return { mode: "manual", fallback: null };
+	return { mode: null, fallback: null }; // 无法识别的标签:按取消处理,不猜测写入
+}
+
+// ---- 策略文件 IO(checkout 根;与 CLI 进程封装一样是无状态模块级函数) ----
+
+/** git rev-parse --show-toplevel:checkout 根;失败/非 git 目录 → null。 */
+function gitCheckoutRoot(cwd: string): string | null {
+	try {
+		const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, windowsHide: true });
+		if (g.status !== 0) return null;
+		const root = String(g.stdout ?? "").trim();
+		return root || null;
+	} catch {
+		return null;
+	}
+}
+
+/** 读 checkout 根的 .delta/settings.json:缺文件/非 git 目录 = 未配置;读不了(权限等)= manual + problem。 */
+function readRepoPolicyFile(root: string): PolicyFile {
+	let text: string;
+	try {
+		text = fs.readFileSync(path.join(root, ".delta", "settings.json"), "utf8");
+	} catch (e) {
+		if ((e as any)?.code === "ENOENT") return { policy: { mode: "manual", configured: false } };
+		return { policy: { mode: "manual", configured: false, problem: "读取失败:" + String(e instanceof Error ? e.message : e) } };
+	}
+	return readProjectPolicy(text);
+}
+
+function writeRepoPolicyFile(root: string, text: string): void {
+	const p = path.join(root, ".delta", "settings.json");
+	fs.mkdirSync(path.dirname(p), { recursive: true });
+	fs.writeFileSync(p, text, "utf8");
+}
+
+/** delta-claude 约定(setup.ts excludeFromGit):策略是个人选择,写进 <git-common-dir>/info/exclude
+ *  (仓库本地、不被跟踪、不碰被跟踪的 .gitignore);条目 "/.delta/settings.json" 锚定仓库根,
+ *  不会波及 Delta 自己的 .delta/ worktree 簿记目录。失败返回 false,调用方提示手动加 .gitignore。 */
+const POLICY_EXCLUDE_ENTRY = "/.delta/settings.json";
+
+function excludeFromGit(root: string): boolean {
+	try {
+		const g = spawnSync("git", ["rev-parse", "--git-common-dir"], { cwd: root, windowsHide: true });
+		if (g.status !== 0) return false;
+		const common = String(g.stdout ?? "").trim().replace(/[\\/]+$/, "");
+		if (!common) return false;
+		const excludePath = path.isAbsolute(common) ? path.join(common, "info", "exclude") : path.join(root, common, "info", "exclude");
+		const contents = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+		if (contents.split(/\r?\n/).some((l) => l.trim() === POLICY_EXCLUDE_ENTRY)) return true;
+		fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+		fs.writeFileSync(excludePath, contents + (contents && !contents.endsWith("\n") ? "\n" : "") + POLICY_EXCLUDE_ENTRY + "\n", "utf8");
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /** 实测回执形状:
@@ -1196,8 +1422,13 @@ export default function ompDelta(pi: any) {
 		);
 	}
 
-	/** 后台重试连接(供给窗口期实测可达 10+ 分钟,预算 40×30s)。 */
-	async function retryConnect(mode: "private" | "organization", org: { id: string; name: string }): Promise<void> {
+	/** 后台重试连接(供给窗口期实测可达 10+ 分钟,预算 40×30s)。failLabel:/delta-share 用默认重连文案,
+	 *  #21 自动连接传自己的失败前缀。 */
+	async function retryConnect(
+		mode: "private" | "organization",
+		org: { id: string; name: string },
+		failLabel = "Delta 重连失败",
+	): Promise<void> {
 		try {
 			await connectShared(mode, org);
 		} catch (e) {
@@ -1207,11 +1438,57 @@ export default function ompDelta(pi: any) {
 				if (rt.connectAttempts % 5 === 0)
 					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
 				schedule(() => {
-					void retryConnect(mode, org);
+					void retryConnect(mode, org, failLabel);
 				}, 30_000);
 				return;
 			}
-			notify("Delta 重连失败:" + msg, "warning");
+			rt.expectingIdentity = false; // 确定性失败:不再让记录滞留临时队列(auto-connect 路径需要;share 路径本就为 false)
+			notify(failLabel + ":" + msg, "warning");
+		}
+	}
+
+	/** #21:仓库策略存的组织 id(delta-claude 存 team.id 同构)。名字仅展示用;
+	 *  org list 可解析时校验 id 在账号名下,避免把确定性失败(组织不在账号里)送进供给窗口重试循环。 */
+	async function resolveStoredOrg(organizationId: string): Promise<{ id: string; name: string }> {
+		const r = await runDelta(["org", "list"]);
+		const combined = r.out + "\n" + r.err;
+		if (isUnauthenticatedText(combined)) throw new Error(ORG_UNAUTH_HINT);
+		const orgs = parseOrgListFromText(combined);
+		if (orgs === null) return { id: organizationId, name: organizationId }; // 无载荷:交给 connectShared 报具体错误
+		const hit = orgs.find((o) => o.id === organizationId);
+		if (!hit) throw new Error("仓库策略指向的组织 " + organizationId + " 不在当前账号的组织列表;请运行 /delta-setup 重新选择。");
+		return { id: hit.id, name: hit.name || hit.id };
+	}
+
+	/** #21:仓库策略自动连接(仅后台调用:marker 重连与 checkout 发现都未命中才走到这里)。
+	 *  失败语义与 /delta-share 相同:供给窗口走既有 retryConnect 退避,确定性失败只警告;
+	 *  自身绝不抛出,不影响 session_start 的 30s 预算(整段在后台 IIFE 里)。 */
+	async function autoConnect(mode: "private" | "organization", organizationId: string): Promise<void> {
+		if (rt.connected || rt.threadId) return; // 手动 /delta-share 等路径已抢先:幂等 create 也会撞同一线程,直接让位
+		notify("仓库策略 " + (mode === "private" ? "private" : "organization") + ":自动连接 Delta…");
+		let org: { id: string; name: string };
+		try {
+			org = await resolveStoredOrg(organizationId);
+		} catch (e) {
+			rt.expectingIdentity = false;
+			notify("Delta 自动连接失败:" + String(e instanceof Error ? e.message : e), "warning");
+			return;
+		}
+		try {
+			await connectShared(mode, org);
+		} catch (e) {
+			const msg = String(e instanceof Error ? e.message : e);
+			if (isTransientProvisioning(msg) && rt.connectAttempts < 40) {
+				rt.connectAttempts += 1;
+				if (rt.connectAttempts === 1 || rt.connectAttempts % 5 === 0)
+					notify("Delta 供给窗口等待中(第 " + rt.connectAttempts + " 次重试):" + msg);
+				schedule(() => {
+					void retryConnect(mode, org, "Delta 自动连接失败");
+				}, 30_000);
+				return; // 供给窗口:expectingIdentity 保持,记录继续入临时队列
+			}
+			rt.expectingIdentity = false;
+			notify("Delta 自动连接失败:" + msg + "(可用 /delta-share 手动连接)", "warning");
 		}
 	}
 
@@ -1405,6 +1682,9 @@ export default function ompDelta(pi: any) {
 		description: "查看 omp-delta 连接与同步状态",
 		handler: async (_args: string, ctx: any) => {
 			lastCtx = ctx;
+			// #21:仓库策略一行展示,让"为什么自动连接了/没连"可见
+			const policyRoot = gitCheckoutRoot(rt.cwd);
+			const pf = policyRoot ? readRepoPolicyFile(policyRoot) : null;
 			const lines = [
 				"连接: " + (rt.connected ? "已连接" : "未连接") + (rt.paused ? "(推送暂停)" : ""),
 				"线程: " + (rt.threadId ?? "无"),
@@ -1414,8 +1694,101 @@ export default function ompDelta(pi: any) {
 				"worktree: " + (rt.worktreeRef ?? "无"),
 				"mount/watch: " + (rt.mountChild ? "运行中" : "停止") + " / " + (rt.watchChild ? "运行中" : "停止"),
 				"会话: " + (rt.isSub ? "子代理(不记录)" : "主会话") + " · " + rt.sid,
+				"策略: " + (pf ? renderProjectPolicy(pf.policy) : "无 Git checkout(不适用)"),
 			].filter(Boolean);
 			notify(lines.join("\n"));
+		},
+	});
+
+	registerDeltaCommand("delta-setup", {
+		description: "设置本仓库的 Delta 同步策略(.delta/settings.json,兼容 delta-claude):private|organization|manual;无参数交互选择",
+		handler: async (args: string, ctx: any) => {
+			lastCtx = ctx;
+			rt.cwd = String(ctx?.cwd ?? rt.cwd);
+			if (rt.isSub) {
+				notify("子代理会话暂不支持 /delta-setup。", "warning");
+				return;
+			}
+			const decision = parseSetupModeArg(args);
+			if (decision.kind === "invalid") {
+				notify(
+					"未知模式:" + decision.arg + "\n用法:/delta-setup private|organization|manual(无参数交互选择)。\n" +
+						"private/organization = 新会话自动连接(private 仅自己可见);manual = 仅 /delta-share 手动同步(现状)。",
+					"warning",
+				);
+				return;
+			}
+			const root = gitCheckoutRoot(rt.cwd);
+			if (!root) {
+				notify("/delta-setup 需要 Git checkout:" + rt.cwd + " 下未找到仓库根。", "warning");
+				return;
+			}
+			// 读现有文件:未知键整体保留;malformed 不静默覆盖(delta-claude 同样先征求同意)
+			const policyFile = readRepoPolicyFile(root);
+			if (policyFile.malformed) {
+				let replace = false;
+				if (typeof ctx?.ui?.confirm === "function") {
+					try {
+						replace = await ctx.ui.confirm(
+							"替换无法解析的 .delta/settings.json?",
+							(policyFile.policy.problem ?? "文件不是有效 JSON 对象") + "\n替换后原内容丢失;选择取消可先手动修复。",
+						);
+					} catch {
+						replace = false;
+					}
+				} else {
+					notify(".delta/settings.json 无法解析(" + (policyFile.policy.problem ?? "?") + ");未自动覆盖。请手动修复或删除该文件后重试。", "warning");
+					return;
+				}
+				if (!replace) {
+					notify("已取消,.delta/settings.json 保持原样。");
+					return;
+				}
+			}
+			// 组织:private/organization 必须带(delta-claude 语义);显式 manual 不需要,离线也能钉住现状
+			let org: { id: string; name: string } | null = null;
+			if (!(decision.kind === "set" && decision.mode === "manual")) {
+				try {
+					org = await resolveOrg();
+				} catch (e) {
+					notify(
+						"解析当前组织失败:" + String(e instanceof Error ? e.message : e) +
+							"\nprivate/organization 策略必须带组织;若只想固定手动模式,可运行 /delta-setup manual。",
+						"warning",
+					);
+					return;
+				}
+			}
+			let mode: ThreadMode;
+			if (decision.kind === "set") {
+				mode = decision.mode;
+			} else {
+				const pick = await pickSetupMode(ctx?.ui, org);
+				if (pick.mode === null) {
+					notify("已取消,.delta/settings.json 保持原样。");
+					return;
+				}
+				if (pick.fallback) notify(pick.fallback, "warning");
+				mode = pick.mode;
+			}
+			const text = serializeProjectPolicy(policyFile.document, mode, mode === "manual" ? undefined : org!.id);
+			try {
+				writeRepoPolicyFile(root, text);
+			} catch (e) {
+				notify("写入 .delta/settings.json 失败:" + String(e instanceof Error ? e.message : e), "warning");
+				return;
+			}
+			// delta-claude 约定:策略是个人选择,进 .git/info/exclude 而不是被跟踪的 .gitignore
+			if (!excludeFromGit(root)) {
+				notify("未能把 .delta/settings.json 排除出 Git;若不想提交它,请手动在 .gitignore 加一行:.delta/settings.json", "warning");
+			}
+			const label = mode === "private" ? "Private sync(私有)" : mode === "organization" ? "Team sharing(共享给 " + (org?.name ?? "?") + ")" : "Manual(手动)";
+			notify(
+				"已保存 " + label + " 到 .delta/settings.json。\n" +
+					(mode === "manual"
+						? "新会话仅在你运行 /delta-share 时同步。"
+						: "新会话将自动连接 Delta(" + (mode === "private" ? "私有线程" : "共享给组织 " + org!.name) + ");本会话不受影响,现在连接请运行 /delta-share。"),
+			);
 		},
 	});
 
@@ -1567,9 +1940,17 @@ export default function ompDelta(pi: any) {
 		if (rt.isSub) return;
 		rt.sid = String(ctx?.sessionManager?.getSessionId?.() ?? "sess-" + randomUUID());
 		rt.cwd = String(ctx?.cwd ?? process.cwd());
+		// #21:仓库策略(.delta/settings.json)决定无绑定时的自动连接;文件问题在此一次性提示
+		const policyRoot = gitCheckoutRoot(rt.cwd);
+		const policyFile = policyRoot ? readRepoPolicyFile(policyRoot) : null;
+		if (policyFile?.policy.problem) {
+			notify(".delta/settings.json 无法使用(" + policyFile.policy.problem + ");修复前仅 /delta-share 手动同步生效。", "warning");
+		}
 		// 绑定标记在 omp 会话记录里(appendEntry 写入,生命周期归 omp 管):
-		// 有标记 → 后台凭它重连;无标记 → 等用户显式 /delta-share。
+		// 有标记 → 后台凭它重连;无标记 → 先按 checkout 发现,再按仓库策略自动连接(#21)。
 		const marker = findSessionMarker(ctx);
+		// 决策(纯接缝):marker 永远优先,auto-connect 只兜底真正的全新会话
+		const syncAction = decideAutoSyncAction(policyFile?.policy ?? { mode: "manual", configured: false }, marker !== null);
 		if (marker) {
 			// 不阻塞 session_start(事件处理器有 30s 预算):后台重连;
 			// 等待期间事件照常入临时队列(expectingIdentity),游标到达后重编号补发
@@ -1578,7 +1959,7 @@ export default function ompDelta(pi: any) {
 			void reconnectByIdentity(marker);
 		} else {
 			// 无 marker(moveOff/fork/首次):从服务端按 checkout 发现绑定;
-			// 发现不了才是真正的首次,等用户显式 /delta-share。
+			// 发现不了才是真正的首次:策略为自动模式时自动连接,否则等显式 /delta-share(#21)。
 			rt.expectingIdentity = true;
 			void (async () => {
 				try {
@@ -1586,6 +1967,10 @@ export default function ompDelta(pi: any) {
 					if (found) {
 						notify("发现绑定当前 checkout 的 Delta 线程 " + found.threadId + ",后台重连中…");
 						await reconnectByIdentity(found);
+					} else if (syncAction.kind === "auto-connect") {
+						// 重连路径(marker/checkout 发现)都未命中才自动连接,不会绕过或与重连竞争;
+						// 连接窗口期 expectingIdentity 保持,记录入临时队列,游标到达后重编号
+						await autoConnect(syncAction.mode, syncAction.organization);
 					} else {
 						rt.expectingIdentity = false;
 					}
