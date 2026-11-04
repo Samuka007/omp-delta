@@ -83,9 +83,10 @@ let deltaBin: string | null = null;
 let envDumped = false;
 
 /** #11 诊断:delta 在 omp 内 spawn 时报 NotFound、外部终端同命令秒通。
- *  首次失败时把解析到的二进制与关键 env 写进 omp 日志,定位环境差异。 */
+ *  仅在 OMP_DELTA_DEBUG=1 时,首次 spawn 把解析到的二进制与关键 env 写进 omp 日志,定位环境差异。 */
 function dumpSpawnEnvOnce() {
-	if (envDumped) return;
+		if (envDumped) return;
+		if (process.env.OMP_DELTA_DEBUG !== "1") return;
 	envDumped = true;
 	const keys = ["PATH", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOME", "OMP_SESSION_ID", "DELTA_DATA_DIR", "DELTA_CONFIG_DIR"];
 	const snap = keys
