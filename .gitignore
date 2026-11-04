@@ -1,1 +1,5 @@
 node_modules/
+
+# /delta-setup 的仓库策略(#21):个人选择不入库。只忽略 settings.json 这一个路径,
+# .delta/ 目录本身是 Delta 的 worktree 簿记,保持跟踪。
+.delta/settings.json

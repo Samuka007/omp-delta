@@ -109,6 +109,45 @@ own records!) — count `"type":"item"` frames per kind.
   this build is too old for the installed CLI. Otherwise `/delta-update` always shows a
   constant reinstall-hint footer (`omp plugin install 'github:Samuka007/omp-delta'`).
 
+## Repo policy (`.delta/settings.json`, /delta-setup #21)
+
+Per-repo sync policy, format-compatible with the official Claude Code plugin
+([zed-industries/delta-claude](https://github.com/zed-industries/delta-claude),
+`hooks/setup/project-policy.ts` — the read/write authority both plugins share):
+
+```json
+{
+  "threads": {
+    "mode": "private",
+    "organization": "org_01…"
+  }
+}
+```
+
+- `threads.mode` ∈ `manual` / `private` / `organization` (delta-claude's `ThreadMode`). Note the
+  nesting: a top-level `{"mode": "…"}` is *not* the format — `mode` lives under `threads` and a
+  file with only that is treated as unconfigured.
+- `threads.organization` holds the **org id**: required non-empty for `private`/`organization`
+  (delta-claude saves `team.id`), optional for `manual` (where it names the org `/delta share`
+  shares to). omp stores the id from `delta org list` and resolves the display name from the same list.
+- Missing file / missing `threads` / missing `mode` → unconfigured `manual` (no `problem`):
+  current behavior, explicit `/delta-share` only.
+- Malformed JSON / non-object / invalid mode / auto mode without organization → `manual`
+  fallback plus a `problem` string (one-time `session_start` notice, shown in `/delta-status`);
+  rewriting asks before overwriting an unreadable file and preserves unknown keys (top-level and
+  inside `threads`), 2-space indent + trailing newline — same as delta-claude's `serializeProjectPolicy`.
+- Git exclusion follows delta-claude's convention (`hooks/setup/setup.ts`): on save, the entry
+  `/.delta/settings.json` (root-anchored) is appended to `<git-common-dir>/info/exclude` —
+  repo-local, untracked, personal; the tracked `.gitignore` is not touched. This plugin's own
+  repo `.gitignore` additionally carries `.delta/settings.json` (the `.delta/` worktree
+  bookkeeping directory is a different thing and stays tracked).
+- `session_start` precedence (#21): session-marker reconnect → server-side checkout discovery →
+  policy auto-connect (`private`/`organization` only; the stored org id is validated against
+  `delta org list` so a stale policy fails fast instead of looping in the provisioning retry).
+  `manual`/unconfigured never auto-connects. Auto-connect runs in the session_start background
+  and reuses `/delta-share`'s transient retry path (40×30s provisioning window); the handler
+  itself never blocks or crashes on it.
+
 ## Windows notes
 
 - ~~`state.json` writes must be atomic (tmp + rename)~~ Obsolete since the zero-local-state redesign (#10): the extension no longer writes any state files — identity lives in the omp session record, the delivery cursor is the server's `next_sequence`.
