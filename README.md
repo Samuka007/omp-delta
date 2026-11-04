@@ -11,7 +11,7 @@ A community implementation of the [officially documented plugin contract](https:
 - Teammate comments in Delta flow back into omp context as follow-ups (never auto-trigger a turn)
 - Someone takes over the thread → the local turn stops (`superseded` / `fenced`)
 - Zero local state: thread identity lives in the omp session record + DeltaDB, the delivery cursor is the server's `next_sequence`; undelivered records queue in memory and retryable failures back off automatically
-- `/delta-status`, `/delta-detach`, `/delta-retry` for connection management
+- `/delta-status`, `/delta-detach`, `/delta-retry` for connection management; `/delta-org list|current` for read-only org inspection (no switching)
 
 ## Install
 

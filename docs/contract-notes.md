@@ -7,7 +7,13 @@ flows; this page records details it does not spell out.
 ## CLI conventions
 
 - `--json` is a **global** flag and must precede the subcommand: `delta --json thread create …`. Without it, commands print human-readable text and JSON-line parsers silently starve.
-- All commands this plugin uses accept it: `thread contract/create/append/watch/status/stop`, `worktree create/attach/mount/list`, `org current`.
+- All commands this plugin uses accept it: `thread contract/create/append/watch/status/stop`, `worktree create/attach/mount/list`, `org current`, `org list`.
+
+## Orgs (/delta-org, #19)
+
+- `org list --json` → `{"operation":"listed","organizations":[{"id":"org_01…","name":"ALLE AI","current":true}, …]}` — array order matches the pretty display, exactly one entry carries `current:true`; empty array = signed in but no orgs.
+- `org current --json` → `{"operation":"current","organization":{"id":"…","name":"…","current":true}}`. Pretty output marks the current org with a leading `*`.
+- Unauthenticated signatures (observed in the delta.exe binary's error strings): `not signed in` / `authentication required` — the plugin matches these on stdout+stderr and shows an actionable `delta auth login` hint instead of a raw parse error. `/delta-org` is read-only: no switching, no invite management.
 
 ## Threads
 

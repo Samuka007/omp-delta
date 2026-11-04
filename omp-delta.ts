@@ -10,7 +10,7 @@
  * MVP 范围:
  *   - 只记录主会话(ctx.agent.kind === "main");子代理 → Delta 子线程留待下一步
  *   - 首次连接从当下开始记录,不回导历史会话
- *   - 命令:/delta-share /delta-status /delta-detach /delta-retry
+ *   - 命令:/delta-share /delta-status /delta-detach /delta-retry /delta-org(只读)
  *
  * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
  * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
@@ -240,17 +240,62 @@ function runDeltaJsonFromText(out: string, err: string): any {
 	return js[js.length - 1];
 }
 
+/** delta CLI 未登录时的统一可操作提示(#19:干净错误,不带堆栈)。
+ *  实测签名来自 delta.exe 内嵌错误串:not signed in / authentication required。 */
+const ORG_UNAUTH_HINT = "Delta CLI 未登录:请先运行 delta auth login(或在 Delta 应用内登录)后重试。";
+
 /** 当前选中的组织(创建线程时必须显式指定)。 */
 async function resolveOrg(): Promise<{ id: string; name: string }> {
-	const cur = await runDeltaJson(["org", "current"]);
-	const id = String(cur?.organization?.id ?? "");
-	if (!id) {
-		throw new Error("未能解析当前组织:请用 delta org switch 选择组织后重试。");
+	const r = await runDelta(["org", "current"]);
+	const combined = r.out + "\n" + r.err;
+	if (isUnauthenticatedText(combined)) throw new Error(ORG_UNAUTH_HINT);
+	const org = parseOrgCurrentFromText(combined);
+	if (!org) {
+		throw new Error("未能解析当前组织(code " + r.code + "):请用 delta org switch 选择组织后重试。");
 	}
-	return { id, name: String(cur?.organization?.name ?? id) };
+	return org;
 }
 
 // ---- 纯函数接缝(可直接单测;合约语义见 docs/contract-notes.md) ----
+
+/** 未登录判定:对 delta 的 stdout+stderr 原文做签名匹配(不区分 JSON/纯文本)。 */
+export function isUnauthenticatedText(text: string): boolean {
+	return /not signed in|not logged in|unauthenticated|authentication required|please (?:log|sign) in|unauthorized/i.test(text);
+}
+
+export type OrgInfo = { id: string; name: string; current: boolean };
+
+/** 解析 `delta org list --json` 输出:{"operation":"listed","organizations":[{id,name,current}]}
+ *  (顺序即 CLI pretty 展示顺序,current:true 恰好一个)。parseJsonLines 统一入口,
+ *  pretty-printed 整体 JSON 与逐行 JSONL 都能吃;顶层裸数组也接受。
+ *  返回 null = 没有任何组织载荷(失败/未登录);[] = 已登录但未加入任何组织。 */
+export function parseOrgListFromText(text: string): OrgInfo[] | null {
+	for (const js of parseJsonLines(text)) {
+		const arr = Array.isArray(js?.organizations) ? js.organizations : Array.isArray(js) ? js : null;
+		if (!arr) continue;
+		return arr
+			.map((o: any) => ({ id: String(o?.id ?? ""), name: String(o?.name ?? ""), current: o?.current === true }))
+			.filter((o) => o.id);
+	}
+	return null;
+}
+
+/** 解析 `delta org current --json` 输出:{"operation":"current","organization":{id,name,current}}。 */
+export function parseOrgCurrentFromText(text: string): { id: string; name: string } | null {
+	for (const js of parseJsonLines(text)) {
+		const id = String(js?.organization?.id ?? "");
+		if (id) return { id, name: String(js?.organization?.name ?? id) };
+	}
+	return null;
+}
+
+/** /delta-org list 渲染:沿用 CLI 自身 pretty 约定(行首 `*` 标记当前组织)。 */
+export function formatOrgList(orgs: OrgInfo[]): string {
+	if (orgs.length === 0) return "未加入任何组织。";
+	return orgs
+		.map((o) => (o.current ? "* " : "  ") + o.name + " (" + o.id + ")" + (o.current ? " ← 当前:共享将使用此组织" : ""))
+		.join("\n");
+}
 
 /** 实测回执形状:
  *  {"operation":"appended","sequence":N,"next_sequence":N+1,"duplicate":false,
@@ -1176,6 +1221,38 @@ export default function ompDelta(pi: any) {
 				return;
 			}
 			detach();
+		},
+	});
+
+	pi.registerCommand("delta-org", {
+		description: "查看 Delta 组织(只读):list 列出并标记当前组织;current 显示共享将使用的组织",
+		handler: async (args: string, ctx: any) => {
+			lastCtx = ctx;
+			const mode = (String(args ?? "").trim().split(/\s+/)[0] ?? "").toLowerCase() || "list";
+			if (mode !== "list" && mode !== "current") {
+				notify("用法:/delta-org list(列出组织并标记当前)/ /delta-org current(查看共享将使用的组织)。只读命令:切换组织请用 delta org switch。");
+				return;
+			}
+			try {
+				if (mode === "current") {
+					const org = await resolveOrg(); // 与 /delta-share 同一来源:展示共享实际会使用的组织
+					notify("共享将使用的组织:" + org.name + "(" + org.id + ")");
+					return;
+				}
+				const r = await runDelta(["org", "list"]);
+				const combined = r.out + "\n" + r.err;
+				const orgs = parseOrgListFromText(combined);
+				if (!orgs) {
+					notify(
+						isUnauthenticatedText(combined) ? ORG_UNAUTH_HINT : "delta org list 失败(code " + r.code + "):" + (r.err || r.out).slice(0, 200),
+						"warning",
+					);
+					return;
+				}
+				notify(orgs.length > 0 ? "Delta 组织(" + orgs.length + "):\n" + formatOrgList(orgs) : formatOrgList(orgs));
+			} catch (e) {
+				notify("delta org 失败:" + String(e instanceof Error ? e.message : e), "warning");
+			}
 		},
 	});
 
