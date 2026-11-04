@@ -63,6 +63,30 @@ Two independent requirements, discovered by controlled experiment:
 Authoritative read-back: `thread watch` **without** `--source/--external-id` (those hide your
 own records!) — count `"type":"item"` frames per kind.
 
+## Update
+
+- `delta update --check` only inspects release metadata (never installs); plain `delta update`
+  installs, and **a running Delta app restarts to install it** (per `--help`).
+- Unlike the other commands, `update` also accepts `--json` after the subcommand, but the
+  global position (`delta --json update …`) works identically — `runDelta` uses the global one.
+- `--json` output is JSONL: a progress frame (`{"type":"progress","phase":"checking"}`, no
+  `status`) followed by the result frame. Live-captured up-to-date shape (delta 0.23.0):
+
+  ```json
+  {"schema_version":1,"status":"up_to_date","current_version":"0.23.0",
+   "latest_version":"0.23.0","channel":"stable","can_install":true,
+   "message":"Delta 0.23.0 is up to date."}
+  ```
+
+  Only `up_to_date` has been observed live; anything else is parsed defensively (any
+  non-`up_to_date` status counts as restart-required).
+- Plugin (omp-delta) outdatedness has no reliable offline signal: the installed
+  `~/.omp/plugins/node_modules/omp-delta/package.json` version has no upstream reference to
+  compare against, and there is no marketplace. The one real signal is the contract
+  handshake: `thread contract` `.min` above the plugin's compiled-in `CONTRACT_MAX` means
+  this build is too old for the installed CLI. Otherwise `/delta-update` always shows a
+  constant reinstall-hint footer (`omp plugin install 'github:Samuka007/omp-delta'`).
+
 ## Windows notes
 
 - ~~`state.json` writes must be atomic (tmp + rename)~~ Obsolete since the zero-local-state redesign (#10): the extension no longer writes any state files — identity lives in the omp session record, the delivery cursor is the server's `next_sequence`.

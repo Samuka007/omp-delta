@@ -10,7 +10,7 @@
  * MVP 范围:
  *   - 只记录主会话(ctx.agent.kind === "main");子代理 → Delta 子线程留待下一步
  *   - 首次连接从当下开始记录,不回导历史会话
- *   - 命令:/delta-share /delta-status /delta-detach /delta-retry /delta-org(只读)
+ *   - 命令:/delta-share /delta-status /delta-detach /delta-retry /delta-org(只读) /delta-update
  *
  * 架构说明:omp 会为每个会话(含子代理)重新绑定扩展工厂,但模块变量跨会话共享。
  * 因此所有可变状态都放在工厂闭包创建的 Runtime 里(每会话一份,互不污染);
@@ -32,10 +32,14 @@ const CONTRACT_MIN = 8; // 本插件实现的合约版本
 const CONTRACT_MAX = 8;
 const SCHEMA_VERSION = 1;
 const APPEND_TIMEOUT_MS = 30_000;
+const UPDATE_TIMEOUT_MS = 300_000; // delta update 下载+安装远慢于 append:5 分钟预算
 const MOUNT_READY_TIMEOUT_MS = 90_000;
 const MAX_AUTO_RETRIES = 3;
 const MAX_HISTORY_WAIT_ATTEMPTS = 60; // not_visible 供给窗口期:30s × 60 ≈ 30 分钟(实测可超 10 分钟)
 const MARKER_TYPE = "omp-delta.attachment"; // 写入 omp 会话的绑定标记(appendEntry,不进 LLM 上下文)
+// /delta-update:omp 没有 marketplace 自动更新,插件过期只能手动重装(#20)。
+// 无可靠"插件已过期"程序化信号时,这条命令是重装指引的唯一保证(见 renderUpdateReport)。
+export const PLUGIN_REINSTALL_CMD = "omp plugin install 'github:Samuka007/omp-delta'";
 // 供给窗口期签名:append 错误分类与连接重试共用一套,保持同步
 const NOT_VISIBLE_RE = /not_visible|history is unavailable/i;
 const PROVISIONING_RE = /history is unavailable|not_visible|not in this account|invalid_reference|worktree_storage_failed/i;
@@ -558,6 +562,101 @@ export function renumberFrom(pending: DeltaRecord[], serverNext: number): Renumb
 		s += 1;
 	}
 	return { pending, seq: s - 1, lastAcked: Math.max(0, serverNext - 1), seqMap };
+}
+
+// ---- /delta-update:delta update 包装(#20) ----
+
+/** 实测 `delta --json update --check` 输出(JSONL 两行;up-to-date 时 `delta update`
+ *  输出同形,见 docs/contract-notes.md):
+ *  {"schema_version":1,"type":"progress","phase":"checking"}
+ *  {"schema_version":1,"status":"up_to_date","current_version":"0.23.0",
+ *   "latest_version":"0.23.0","channel":"stable","can_install":true,
+ *   "message":"Delta 0.23.0 is up to date."}
+ *  progress 帧没有 status;取最后一个带 status 的对象。up_to_date 之外的状态一律
+ *  视为需要安装/重启 —— `delta update --help`:"A running Delta app restarts to
+ *  install it"(仅 up_to_date 形状实采过,其余防御性解析)。 */
+export type DeltaUpdateParsed = {
+	status: string;
+	currentVersion: string;
+	latestVersion: string;
+	channel: string;
+	canInstall: boolean;
+	message: string;
+	restartRequired: boolean;
+};
+
+export function parseUpdateResult(text: string): DeltaUpdateParsed | null {
+	let picked: any = null;
+	for (const j of parseJsonLines(text)) {
+		if (j && typeof j.status === "string" && j.status) picked = j;
+	}
+	if (!picked) return null;
+	const current = String(picked.current_version ?? "");
+	const upToDate = picked.status === "up_to_date";
+	return {
+		status: String(picked.status),
+		currentVersion: current,
+		latestVersion: String(picked.latest_version ?? "") || current,
+		channel: String(picked.channel ?? ""),
+		canInstall: picked.can_install === true,
+		message: String(picked.message ?? ""),
+		restartRequired: !upToDate,
+	};
+}
+
+/** 插件过期的唯一可靠程序化信号:omp 加载的就是安装目录里的这份构建,其支持上限
+ *  是编译期常量 CONTRACT_MAX;`thread contract` 的 min 超过它 ⇒ 本插件对当前 Delta
+ *  过旧,必须重装。安装目录 package.json 只有本地版本、没有"最新版"参照(联网查
+ *  GitHub 不做:网络依赖且非 marketplace 语义),除此之外没有离线信号 —— 此时
+ *  只剩 renderUpdateReport 的常量页脚提示。 */
+export function pluginOutdatedFromContract(contract: { min?: unknown } | null | undefined): boolean {
+	const min = Number(contract?.min);
+	return Number.isFinite(min) && min > CONTRACT_MAX;
+}
+
+const UPDATE_RESTART_NOTE =
+	"重启说明:Delta 应用会自动重启完成安装;omp 侧建议 /delta-retry 重连(或重启 omp),让 mount/watch 子进程改用新版 CLI。";
+const PLUGIN_HINT_FOOTER =
+	"提示:omp 没有 marketplace 自动更新,omp-delta 插件过期时不会自动升级;如需更新请重装: " + PLUGIN_REINSTALL_CMD;
+
+export type UpdateReportInput = {
+	mode: "check" | "update";
+	result: DeltaUpdateParsed | null;
+	errorText?: string; // 非零退出/无 JSON 时的原始输出
+	contractMin?: number | null; // thread contract 的 min(拿不到为 null:不下结论)
+};
+
+/** /delta-update 的汇报文本:版本状态 / 安装结果 / 重启要求 / 插件重装提示。
+ *  重装提示是常量页脚,每次 check/update 后都出现 —— 插件过期没有可靠的离线信号,
+ *  这条是唯一保证到位的指引(pluginOutdatedFromContract 只在合约 min 超上限时
+ *  把提示升级为"必须重装")。 */
+export function renderUpdateReport(input: UpdateReportInput): string {
+	const lines: string[] = [];
+	const check = input.mode === "check";
+	if (pluginOutdatedFromContract({ min: input.contractMin })) {
+		lines.push(
+			"检测到 omp-delta 插件对当前 Delta 过旧(合约 min " + input.contractMin + " > 插件支持 " + CONTRACT_MAX + "),必须重装: " + PLUGIN_REINSTALL_CMD,
+		);
+	}
+	const p = input.result;
+	if (!p) {
+		const raw = (input.errorText ?? "").trim() || "无输出";
+		lines.push((check ? "Delta 更新检查失败" : "Delta 更新失败") + ": " + raw.slice(0, 300));
+	} else if (p.status === "up_to_date") {
+		lines.push(
+			(check ? "Delta 更新检查:" : "Delta 更新:") + "已是最新(" + p.currentVersion + (p.channel ? "," + p.channel : "") + ")" + (check ? "。仅检查,未安装任何内容。" : "."),
+		);
+	} else if (check) {
+		lines.push(
+			"Delta 更新检查:发现新版本 " + p.latestVersion + "(当前 " + p.currentVersion + (p.channel ? "," + p.channel : "") + ")。仅检查,未安装;运行 /delta-update 安装。",
+		);
+		lines.push(UPDATE_RESTART_NOTE);
+	} else {
+		lines.push("Delta 更新(" + p.status + "):" + (p.message || ("current " + p.currentVersion + " → latest " + p.latestVersion)));
+		lines.push(UPDATE_RESTART_NOTE);
+	}
+	lines.push(PLUGIN_HINT_FOOTER);
+	return lines.join("\n");
 }
 
 // ---- 扩展工厂:每会话一份 Runtime ----
@@ -1341,6 +1440,41 @@ export default function ompDelta(pi: any) {
 			} else {
 				void flush();
 			}
+		},
+	});
+
+	pi.registerCommand("delta-update", {
+		description: "检查或安装 Delta 更新(/delta-update check 仅检查不安装);输出含 omp-delta 插件重装提示",
+		handler: async (args: string, ctx: any) => {
+			lastCtx = ctx;
+			rt.cwd = String(ctx?.cwd ?? rt.cwd);
+			const mode: "check" | "update" = String(args ?? "").trim().toLowerCase().startsWith("check") ? "check" : "update";
+			notify(mode === "check" ? "正在检查 Delta 更新…" : "正在更新 Delta(下载与安装可能需要几分钟)…");
+			// runDelta 统一加全局 --json:实测 `delta --json update --check` 与 `delta update --check --json` 输出一致
+			const r = await runDelta(mode === "check" ? ["update", "--check"] : ["update"], {
+				cwd: rt.cwd,
+				timeoutMs: UPDATE_TIMEOUT_MS,
+			});
+			const ok = r.code === 0;
+			const parsed = parseUpdateResult(r.out + (r.err ? "\n" + r.err : ""));
+			// 插件过期检测:合约 min 超过本构建支持上限 ⇒ 必须重装;拿不到合约就不下结论,只留常量提示
+			let contractMin: number | null = null;
+			try {
+				const c = await runDeltaJson(["thread", "contract"], { cwd: rt.cwd });
+				const min = Number(c?.min);
+				if (Number.isFinite(min)) contractMin = min;
+			} catch {
+				/* 无合约输出:仅保留常量提示 */
+			}
+			notify(
+				renderUpdateReport({
+					mode,
+					result: ok ? parsed : null,
+					errorText: ok && parsed ? undefined : (ok ? "" : "exit " + r.code + ": ") + String(r.err || r.out),
+					contractMin,
+				}),
+				ok && parsed ? "info" : "warning",
+			);
 		},
 	});
 
